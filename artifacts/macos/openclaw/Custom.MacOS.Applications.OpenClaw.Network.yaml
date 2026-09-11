@@ -1,0 +1,40 @@
+name: Custom.MacOS.Applications.OpenClaw.Network
+description: |
+  Ports d'ecoute locaux associes a OpenClaw (Gateway WebSocket 18789 par
+  defaut, Control Service 18791, CDP Browser Relay 18792, navigateurs geres
+  18800+), enrichis des informations process via l'artefact standard
+  MacOS.Network.Netstat.
+
+  Observe sur la cible de validation (2026-09-10) : le process "openclaw" (pid 6033, node
+  /opt/homebrew/Cellar/node/26.3.0/bin/node, lance manuellement en CLI le
+  2026-09-02, PAS via le LaunchAgent) ecoute simultanement sur ::1:18789 et
+  127.0.0.1:18789. Seul le port 18789 a ete observe en LISTEN sur cette
+  machine ; 18791/18792/18800+ n'ont pas ete vus actifs (Browser Relay non
+  utilise dans ce test) : absence documentee, pas une preuve que ces
+  fonctionnalites sont inutilisables.
+
+type: CLIENT
+
+author: Safercy DFIR (recherche Velociraptor OpenClaw)
+
+precondition: SELECT OS FROM info() WHERE OS = 'darwin'
+
+parameters:
+  - name: PortRegex
+    type: regex
+    default: "^(1878[0-9]|1879[0-9]|188[0-2][0-9])$"
+    description: Plage de ports geree par OpenClaw (gateway/control/CDP relay/navigateurs).
+
+sources:
+  - name: OpenClawPorts
+    query: |
+      LET Ports = SELECT * FROM Artifact.MacOS.Network.Netstat(ConnectionStatusRegex='.')
+
+      SELECT Laddr, Lport, Raddr, Rport, Status, Type, Pid,
+             ProcInfo.Name AS ProcessName, ProcInfo.Exe AS ProcessExe,
+             ProcInfo.CommandLine AS CommandLine, ProcInfo.Username AS Username,
+             ProcInfo.CreateTime AS ProcessCreateTime
+      FROM Ports
+      WHERE format(format='%d', args=Lport) =~ PortRegex
+         OR ProcInfo.Name =~ '(?i)^openclaw$'
+         OR ProcInfo.CommandLine =~ '(?i)openclaw'

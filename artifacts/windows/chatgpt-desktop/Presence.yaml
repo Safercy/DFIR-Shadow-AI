@@ -1,0 +1,25 @@
+name: Custom.Windows.Detection.ChatGPTDesktopPresence
+description: |
+  Read-only triage. No uploads or conversation contents. Amcache and package times are metadata, not first execution.
+type: CLIENT
+precondition: |
+  SELECT OS FROM info() WHERE OS = 'windows'
+sources:
+  - name: Packages
+    query: |
+      SELECT OSPath, Size, IsDir, Mtime, Btime FROM glob(globs=['C:/Users/*/AppData/Local/Packages/OpenAI.*', 'C:/Program Files/WindowsApps/OpenAI.*', 'C:/Users/*/AppData/Roaming/ChatGPT', 'C:/Users/*/AppData/Local/ChatGPT'], accessor='ntfs')
+  - name: Processes
+    query: |
+      SELECT Pid, Ppid, Name, Exe, Username, CreateTime FROM pslist() WHERE Name =~ '(?i)chatgpt'
+  - name: Prefetch
+    query: |
+      SELECT * FROM Artifact.Windows.Forensics.Prefetch(binaryRegex='(?i)chatgpt')
+  - name: Amcache
+    query: |
+      SELECT * FROM Artifact.Windows.Detection.Amcache() WHERE EntryName =~ '(?i)chatgpt|openai[.]codex' OR EntryPath =~ '(?i)chatgpt|openai[.]codex' OR EntryKey =~ '(?i)chatgpt|openai[.]codex'
+  - name: UserAssist
+    query: |
+      SELECT * FROM Artifact.Windows.Registry.UserAssist() WHERE Name =~ '(?i)chatgpt'
+  - name: ProfileInventory
+    query: |
+      SELECT OSPath, Size, IsDir, Mtime, Ctime, Btime FROM glob(globs=['C:/Users/*/AppData/Local/Packages/OpenAI.*/**','C:/Users/*/AppData/Roaming/Codex/**','C:/Users/*/AppData/Local/Codex/**','C:/Users/*/AppData/Roaming/ChatGPT/**','C:/Users/*/AppData/Local/ChatGPT/**','C:/Users/*/.codex/**'], accessor='ntfs')

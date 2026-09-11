@@ -1,0 +1,167 @@
+name: Custom.MacOS.Applications.OpenClaw.StateDB
+description: |
+  Interroge la base d'etat centrale ~/.openclaw/state/openclaw.sqlite (+
+  -wal/-shm). DECOUVERTE EMPIRIQUE majeure sur la cible de validation (2026-09-10, OpenClaw
+  v2026.6.9) : cette base (absente du dossier de recherche initial, qui ne
+  connaissait que agents/<id>/agent/openclaw-agent.sqlite) centralise plus de
+  90 tables et remplace, sur cette version, une bonne partie des artefacts
+  "fichiers plats" documentes par le papier academique de reference (avril
+  2026) : cron/jobs.json et cron/runs/*.jsonl -> tables cron_jobs et
+  cron_run_logs ; subagents/runs.json -> table subagent_runs ; on trouve en
+  plus task_runs, flow_runs, command_log_entries, delivery_queue_entries,
+  device_pairing_pending/paired, node_pairing_pending/paired,
+  channel_pairing_requests/allow_entries, device_bootstrap_tokens,
+  device_identities, device_auth_tokens, backup_runs, migration_runs/sources,
+  diagnostic_events, diagnostic_stability_bundles (miroir probable de
+  logs/stability/*.json), gateway_restart_sentinel/intent/handoff,
+  agent_databases (mapping agent -> fichier sqlite, utile pour decouvrir les
+  agents sans deviner de nom), acp_sessions/acp_replay_sessions/
+  acp_replay_events, capture_sessions/blobs/events (captures ecran/voix ?),
+  media_blobs, skill_uploads, web_push_subscriptions/vapid_keys,
+  apns_registrations, voicewake_*, android_notification_recent_packages
+  (compagnon mobile), macos_port_guardian_records, current_conversation_bindings.
+
+  Ceci illustre le rythme d'evolution rapide du produit : NE PAS supposer que
+  cette liste de tables est stable dans le temps ; verifier sqlite_master a
+  chaque usage (source SchemaDump ci-dessous) avant de s'appuyer sur les
+  sources nommees.
+
+  Chaque source nommee ci-dessous cible une table a forte valeur forensique
+  avec une limite de lignes ; la source generique AnyTable permet d'
+  interroger une table arbitraire decouverte via SchemaDump.
+
+type: CLIENT
+
+author: Safercy DFIR (recherche Velociraptor OpenClaw)
+
+precondition: SELECT OS FROM info() WHERE OS = 'darwin'
+
+parameters:
+  - name: ProfileGlob
+    default: /Users/*
+  - name: StateDirNameGlob
+    default: ".openclaw*"
+  - name: RowLimit
+    type: int64
+    default: 5000
+  - name: Table
+    default: ""
+    description: Nom de table pour la source AnyTable (laisser vide pour desactiver).
+
+export: |
+  LET Profiles = SELECT OSPath AS HomeDir FROM glob(globs=ProfileGlob) WHERE IsDir
+
+  LET StateDbs = SELECT * FROM foreach(row=Profiles, query={
+    SELECT HomeDir.Path AS UserProfile, OSPath
+    FROM glob(globs=HomeDir.Path + '/' + StateDirNameGlob + '/state/openclaw.sqlite', accessor='file')
+  })
+
+sources:
+  - name: SchemaDump
+    query: |
+      SELECT * FROM foreach(row=StateDbs, query={
+        SELECT UserProfile, OSPath AS SourcePath, type AS ObjectType, name AS ObjectName, tbl_name AS TableName, sql AS CreateStatement
+        FROM sqlite(file=OSPath, query="SELECT type, name, tbl_name, sql FROM sqlite_master WHERE type IN ('table','view')")
+      })
+
+  - name: AgentDatabases
+    query: |
+      SELECT * FROM foreach(row=StateDbs, query={
+        SELECT UserProfile, OSPath AS SourcePath, * FROM sqlite(file=OSPath, query='SELECT * FROM agent_databases')
+      }) WHERE count() <= RowLimit
+
+  - name: CronJobs
+    query: |
+      SELECT * FROM foreach(row=StateDbs, query={
+        SELECT UserProfile, OSPath AS SourcePath, * FROM sqlite(file=OSPath, query='SELECT * FROM cron_jobs')
+      }) WHERE count() <= RowLimit
+
+  - name: CronRunLogs
+    query: |
+      SELECT * FROM foreach(row=StateDbs, query={
+        SELECT UserProfile, OSPath AS SourcePath, * FROM sqlite(file=OSPath, query='SELECT * FROM cron_run_logs ORDER BY rowid DESC')
+      }) WHERE count() <= RowLimit
+
+  - name: SubagentRuns
+    query: |
+      SELECT * FROM foreach(row=StateDbs, query={
+        SELECT UserProfile, OSPath AS SourcePath, * FROM sqlite(file=OSPath, query='SELECT * FROM subagent_runs')
+      }) WHERE count() <= RowLimit
+
+  - name: TaskRuns
+    query: |
+      SELECT * FROM foreach(row=StateDbs, query={
+        SELECT UserProfile, OSPath AS SourcePath, * FROM sqlite(file=OSPath, query='SELECT * FROM task_runs')
+      }) WHERE count() <= RowLimit
+
+  - name: CommandLogEntries
+    query: |
+      SELECT * FROM foreach(row=StateDbs, query={
+        SELECT UserProfile, OSPath AS SourcePath, * FROM sqlite(file=OSPath, query='SELECT * FROM command_log_entries ORDER BY rowid DESC')
+      }) WHERE count() <= RowLimit
+
+  - name: DevicePairing
+    query: |
+      LET Paired = SELECT * FROM foreach(row=StateDbs, query={
+        SELECT UserProfile, OSPath AS SourcePath, 'paired' AS PairingState, *
+        FROM sqlite(file=OSPath, query='SELECT * FROM device_pairing_paired')
+      })
+      LET Pending = SELECT * FROM foreach(row=StateDbs, query={
+        SELECT UserProfile, OSPath AS SourcePath, 'pending' AS PairingState, *
+        FROM sqlite(file=OSPath, query='SELECT * FROM device_pairing_pending')
+      })
+      SELECT * FROM chain(a=Paired, b=Pending) WHERE count() <= RowLimit
+
+  - name: DeliveryQueue
+    query: |
+      SELECT * FROM foreach(row=StateDbs, query={
+        SELECT UserProfile, OSPath AS SourcePath, * FROM sqlite(file=OSPath, query='SELECT * FROM delivery_queue_entries')
+      }) WHERE count() <= RowLimit
+
+  - name: BackupAndMigrationRuns
+    query: |
+      LET Backups = SELECT * FROM foreach(row=StateDbs, query={
+        SELECT UserProfile, OSPath AS SourcePath, 'backup' AS RunType, *
+        FROM sqlite(file=OSPath, query='SELECT * FROM backup_runs')
+      })
+      LET Migrations = SELECT * FROM foreach(row=StateDbs, query={
+        SELECT UserProfile, OSPath AS SourcePath, 'migration' AS RunType, *
+        FROM sqlite(file=OSPath, query='SELECT * FROM migration_runs')
+      })
+      SELECT * FROM chain(a=Backups, b=Migrations) WHERE count() <= RowLimit
+
+  - name: GatewayRestart
+    query: |
+      LET Sentinel = SELECT * FROM foreach(row=StateDbs, query={
+        SELECT UserProfile, OSPath AS SourcePath, 'sentinel' AS Kind, *
+        FROM sqlite(file=OSPath, query='SELECT * FROM gateway_restart_sentinel')
+      })
+      LET Intent = SELECT * FROM foreach(row=StateDbs, query={
+        SELECT UserProfile, OSPath AS SourcePath, 'intent' AS Kind, *
+        FROM sqlite(file=OSPath, query='SELECT * FROM gateway_restart_intent')
+      })
+      LET Handoff = SELECT * FROM foreach(row=StateDbs, query={
+        SELECT UserProfile, OSPath AS SourcePath, 'handoff' AS Kind, *
+        FROM sqlite(file=OSPath, query='SELECT * FROM gateway_restart_handoff')
+      })
+      SELECT * FROM chain(a=Sentinel, b=Intent, c=Handoff) WHERE count() <= RowLimit
+
+  - name: DiagnosticStabilityBundles
+    query: |
+      SELECT * FROM foreach(row=StateDbs, query={
+        SELECT UserProfile, OSPath AS SourcePath, bundle_key AS BundleKey, reason AS Reason,
+               generated_at AS GeneratedAt, timestamp(epoch=created_at / 1000) AS CreatedAt,
+               bundle_json AS BundleJson
+        FROM sqlite(file=OSPath, query='SELECT bundle_key, reason, generated_at, created_at, bundle_json FROM diagnostic_stability_bundles ORDER BY created_at DESC')
+      }) WHERE count() <= RowLimit
+
+  - name: AnyTable
+    query: |
+      LET SafeTable = Table =~ '^[A-Za-z_][A-Za-z0-9_]*$'
+      SELECT * FROM if(condition=Table AND SafeTable, then={
+        SELECT * FROM foreach(row=StateDbs, query={
+          SELECT UserProfile, OSPath AS SourcePath, * FROM sqlite(file=OSPath, query='SELECT * FROM ' + Table)
+        })
+      }, else=if(condition=Table AND NOT SafeTable, then={
+        SELECT 'Table parameter rejected: must match ^[A-Za-z_][A-Za-z0-9_]*$ to avoid SQL injection' AS Error FROM scope()
+      })) WHERE count() <= RowLimit

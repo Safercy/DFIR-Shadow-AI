@@ -1,0 +1,148 @@
+name: Custom.MacOS.Applications.OpenClaw.Sessions
+description: |
+  Extraction des transcripts de conversation OpenClaw : fichiers JSONL sous
+  ~/.openclaw/agents/<agentId>/sessions/, y compris les sessions "topic"
+  (ex. fil Slack : <sessionId>-topic-<threadId>.jsonl) et les sessions
+  supprimees renommees *.jsonl.deleted.<timestamp> (soft-delete non purge,
+  recuperable). Complete par l'index agents/<agentId>/sessions/sessions.json
+  (mapping sessionKey -> sessionId, canal, provider/modele).
+
+  Schema observe et VALIDE sur la cible de validation (2026-09-10, agent "main", canal
+  Slack, 21 lignes reelles sur 2 fichiers de session) : chaque ligne JSONL
+  est un objet avec au minimum `id` (UUID), `parentId` (UUID du message
+  precedent ou null), `type` ("session" pour l'en-tete, "message" pour les
+  tours de conversation observes ici) et `timestamp` (ISO 8601). Pour
+  type="message", le contenu est sous `message.role` ("user"/"assistant") et
+  `message.content`.
+
+  ATTENTION -- `message.content` N'A PAS LA MEME FORME SELON LE ROLE
+  (verifie sur la cible le 2026-09-10, 10 messages user + 9 assistant) :
+
+    * role="user"      -> `content` est une CHAINE brute.
+    * role="assistant" -> `content` est un TABLEAU DE BLOCS, chaque bloc
+                          etant un objet {type, text} ; tous les blocs
+                          observes ici avaient type="text" et le tableau
+                          comptait un seul element.
+
+  C'est l'inverse de ce que supposait la premiere redaction de cet artefact.
+  Consequence pratique : la colonne `Content` (brute, preservee telle quelle)
+  contient du JSON pour les reponses de l'assistant. La colonne `ContentText`
+  normalise les deux formes en texte exploitable, et `ContentIsBlockArray`
+  dit laquelle des deux formes a ete rencontree. Les blocs dont `type` n'est
+  pas "text" (ex. blocs d'outil) ne contribuent pas a `ContentText` : leur
+  contenu reste accessible via `Content`.
+
+  Les types "toolCall", "toolResult", "exec", "thinking",
+  "model_change", "compaction" mentionnes par la documentation/le papier
+  academique de reference N'ONT PAS ete observes sur ce fil de test (aucun
+  outil invoque) : ils restent une HYPOTHESE a confirmer sur une session qui
+  invoque des outils, exposes ici en colonnes nullable best-effort.
+
+  ConversationId = UUID en tete du nom de fichier. TopicId = suffixe apres
+  "-topic-" s'il existe. Deleted=true si le chemin contient ".jsonl.deleted.".
+  MessageId = `id` JSONL (pas un numero de ligne, plus robuste en cas de
+  reordonnancement).
+
+  Ne deduplique pas les messages : les sessions topic et les sessions
+  supprimees peuvent legitimement contenir des ids partages avec la session
+  vivante (branchement) ; SourcePath est conserve pour tracer la provenance
+  exacte.
+
+type: CLIENT
+
+author: Safercy DFIR (recherche Velociraptor OpenClaw)
+
+precondition: SELECT OS FROM info() WHERE OS = 'darwin'
+
+parameters:
+  - name: ProfileGlob
+    default: /Users/*
+  - name: StateDirNameGlob
+    default: ".openclaw*"
+  - name: Include_Deleted
+    type: bool
+    default: Y
+    description: Inclure les sessions soft-supprimees (*.jsonl.deleted.*).
+  - name: MaxRows
+    type: int64
+    default: 200000
+
+export: |
+  LET Profiles = SELECT OSPath AS HomeDir FROM glob(globs=ProfileGlob) WHERE IsDir
+
+  LET SessionFiles = SELECT * FROM foreach(row=Profiles, query={
+    SELECT HomeDir.Path AS UserProfile, OSPath, Mtime, Size
+    FROM glob(globs=[
+      HomeDir.Path + '/' + StateDirNameGlob + '/agents/*/sessions/*.jsonl',
+      HomeDir.Path + '/' + StateDirNameGlob + '/agents/*/sessions/*.jsonl.deleted.*'
+    ], accessor='file')
+  })
+  WHERE Include_Deleted OR NOT OSPath =~ '\\.jsonl\\.deleted\\.'
+
+sources:
+  - name: Transcripts
+    query: |
+      LET Enriched = SELECT UserProfile, OSPath AS SourcePath, Mtime,
+             OSPath =~ '\\.jsonl\\.deleted\\.' AS Deleted,
+             regex_replace(source=basename(path=OSPath), re='\\.jsonl(\\.deleted\\..*)?$', replace='') AS FileStem
+      FROM SessionFiles
+
+      LET WithIds = SELECT *,
+             regex_replace(source=FileStem, re='^([0-9a-fA-F-]{36}).*$', replace='$1') AS ConversationId,
+             if(condition=FileStem =~ '-topic-',
+                then=regex_replace(source=FileStem, re='^[0-9a-fA-F-]{36}-topic-(.*)$', replace='$1'),
+                else=NULL) AS TopicId,
+             regex_replace(source=basename(path=SourcePath), re='^[0-9a-fA-F-]{36}(?:-topic-[^.]+)?\\.jsonl(\\.deleted\\.(.*))?$', replace='$2') AS DeletedAtRaw
+      FROM Enriched
+
+      LET AllLines = SELECT * FROM foreach(row=WithIds, query={
+        SELECT UserProfile, SourcePath, ConversationId, TopicId, Deleted, DeletedAtRaw,
+               count() AS LineNumber, Line, parse_json(data=Line) AS Row
+        FROM parse_lines(filename=SourcePath)
+      })
+
+      SELECT UserProfile, SourcePath, ConversationId, TopicId, Deleted,
+               if(condition=Deleted AND DeletedAtRaw, then=DeletedAtRaw, else=NULL) AS DeletedAtSuffix,
+               LineNumber,
+               Row.id AS MessageId, Row.parentId AS ParentId, Row.type AS Type,
+               if(condition=Row.timestamp, then=timestamp(string=Row.timestamp)) AS Timestamp,
+               Row.timestamp AS TimestampRaw,
+               Row.message.role AS Role,
+               Row.message.content AS Content,
+               Row.message.content[0].type != NULL AS ContentIsBlockArray,
+               if(condition=Row.message.content[0].type,
+                  then=join(array=Row.message.content.text, sep='\n'),
+                  else=Row.message.content) AS ContentText,
+               Row.toolCall AS ToolCall,
+               Row.toolResult AS ToolResult,
+               Row.exec.exitCode AS ExecExitCode,
+               Row.exec.durationMs AS ExecDurationMs,
+               Row.exec.status AS ExecStatus,
+               Row.stopReason AS StopReason,
+               Row.model AS ModelChange,
+               Row.usage AS Usage,
+               Row = NULL AND len(list=Line) > 0 AS ParseError,
+               if(condition=Row = NULL AND len(list=Line) > 0,
+                  then=substr(str=Line, start=0, end=200)) AS ParseErrorSample,
+               'parse_lines + parse_json par ligne (schema JSONL arborescent id/parentId, cf. description)' AS ExtractionMethod
+      FROM AllLines
+      WHERE len(list=Line) > 0 AND count() <= MaxRows
+
+  - name: Index
+    query: |
+      LET IndexFiles = SELECT * FROM foreach(row=Profiles, query={
+        SELECT HomeDir.Path AS UserProfile, OSPath
+        FROM glob(globs=HomeDir.Path + '/' + StateDirNameGlob + '/agents/*/sessions/sessions.json', accessor='file')
+      })
+
+      SELECT * FROM foreach(row=IndexFiles, query={
+        SELECT UserProfile, OSPath AS SourcePath, _key AS SessionKey,
+               _value.sessionId AS SessionId, _value.channel AS Channel,
+               _value.groupChannel AS GroupChannel, _value.origin.provider AS Provider,
+               timestamp(epoch=_value.sessionStartedAt / 1000) AS SessionStartedAt,
+               timestamp(epoch=_value.updatedAt / 1000) AS UpdatedAt,
+               _value.authProfileOverride AS AuthProfileOverride,
+               _value.sessionFile AS SessionFile,
+               'parse_json + items()' AS ExtractionMethod
+        FROM items(item=parse_json(data=read_file(filename=OSPath)))
+      })

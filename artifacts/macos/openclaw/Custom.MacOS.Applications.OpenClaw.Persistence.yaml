@@ -1,0 +1,73 @@
+name: Custom.MacOS.Applications.OpenClaw.Persistence
+description: |
+  Mecanismes de persistance OpenClaw sur macOS : LaunchAgents/LaunchDaemons
+  (utilisateur et systeme) et wrapper d'environnement associe.
+
+  Observe sur la cible de validation (2026-09-10, profil de test) : un seul LaunchAgent
+  utilisateur ~/Library/LaunchAgents/ai.openclaw.gateway.plist, label
+  "ai.openclaw.gateway", RunAtLoad=true, KeepAlive=true, ProgramArguments
+  pointant vers un wrapper ~/.openclaw/service-env/ai.openclaw.gateway-env-wrapper.sh
+  puis le fichier d'environnement ai.openclaw.gateway.env puis
+  /opt/homebrew/opt/node/bin/node .../openclaw/dist/index.js gateway
+  --port 18789 ; StandardOutPath vers ~/Library/Logs/openclaw/gateway.log
+  (chemin non documente dans le dossier de recherche initial, a collecter
+  via Custom.MacOS.Applications.OpenClaw.Logs). Aucun LaunchDaemon systeme,
+  aucun legacy com.openclaw.*/clawdbot*/moltbot* trouve sur cette machine.
+
+  Le comportement de crash-loop (nombreux fichiers
+  logs/stability/*gateway.startup_failed.json generes toutes les ~10s au
+  moment du test) suggere que RunAtLoad+KeepAlive peut redemarrer le
+  processus en boucle si le port est deja occupe par une instance CLI
+  lancee manuellement (observe : process "openclaw" actif depuis le
+  2026-09-02, hors LaunchAgent) ; a correler avec
+  Custom.MacOS.Applications.OpenClaw.Network et StateDB (source
+  GatewayRestart).
+
+  Limite : les elements de login (Login Items /
+  SMAppService) et les regles Login Items modernes ne sont pas lisibles a
+  distance sans executer osascript/sfltool sur l'endpoint ; non couvert ici.
+
+type: CLIENT
+
+author: Safercy DFIR (recherche Velociraptor OpenClaw)
+
+precondition: SELECT OS FROM info() WHERE OS = 'darwin'
+
+parameters:
+  - name: ProfileGlob
+    default: /Users/*
+    description: Racines de profils utilisateurs (utilise pour service-env/).
+  - name: StateDirNameGlob
+    default: ".openclaw*"
+  - name: LaunchAgentGlobs
+    type: csv
+    default: |
+      Glob
+      /Users/*/Library/LaunchAgents/ai.openclaw.*.plist
+      /Users/*/Library/LaunchAgents/com.openclaw.*.plist
+      /Users/*/Library/LaunchAgents/*clawdbot*.plist
+      /Users/*/Library/LaunchAgents/*moltbot*.plist
+      /Library/LaunchAgents/ai.openclaw.*.plist
+      /Library/LaunchDaemons/ai.openclaw.*.plist
+      /Library/LaunchDaemons/com.openclaw.*.plist
+
+sources:
+  - name: LaunchAgentsAndDaemons
+    query: |
+      LET Found = SELECT OSPath, Mtime, Ctime, Btime
+        FROM glob(globs=LaunchAgentGlobs.Glob)
+
+      SELECT OSPath AS SourcePath, Mtime, Ctime, Btime,
+             plist(file=OSPath) AS Content
+      FROM Found
+
+  - name: ServiceEnvWrapper
+    query: |
+      LET Profiles = SELECT OSPath AS HomeDir FROM glob(globs=ProfileGlob) WHERE IsDir
+
+      SELECT * FROM foreach(row=Profiles, query={
+        SELECT HomeDir.Path AS UserProfile, OSPath AS SourcePath, Mtime, Ctime, Size,
+               hash(path=OSPath).SHA256 AS SHA256
+        FROM glob(globs=HomeDir.Path + '/' + StateDirNameGlob + '/service-env/*', accessor='file')
+        WHERE NOT IsDir
+      })

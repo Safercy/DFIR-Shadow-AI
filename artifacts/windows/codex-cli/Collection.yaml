@@ -1,0 +1,41 @@
+name: Custom.Windows.Applications.CodexCLI.Collection
+description: |
+  Read-only NTFS acquisition of the Codex CLI/desktop agent home directory (%USERPROFILE%\.codex). This is the primary source of recoverable prompts and configuration on hosts running the OpenAI Codex app/CLI: session rollout JSONL (raw prompt/response/tool-call event log), thread_history_*.sqlite and state_*.sqlite (structured, queryable index of threads, turns, items, sandbox policy, model, cwd, tokens used), plugin manifests (installed/enabled plugin configuration), and auth.json (live OAuth id_token/access_token/refresh_token/account_id in cleartext, no OS-level encryption observed). auth.json is excluded by default; set IncludeAuth=true to acquire it, since it contains live account-takeover material rather than conversation content. No decryption attempted. Live files are not an atomic snapshot.
+type: CLIENT
+precondition: |
+  SELECT OS FROM info() WHERE OS = 'windows'
+parameters:
+  - name: RootGlob
+    default: C:/Users/*/.codex
+  - name: Accessor
+    default: ntfs
+  - name: IncludeAuth
+    type: bool
+    default: false
+sources:
+  - name: Roots
+    query: |
+      SELECT OSPath, IsDir, Size, Mtime, Ctime, Btime FROM glob(globs=RootGlob, accessor=Accessor)
+  - name: Files
+    query: |
+      LET files <= SELECT OSPath, Size, Mtime, Ctime, Btime, Atime FROM glob(globs=RootGlob + '/**', accessor=Accessor) WHERE NOT IsDir
+      LET patterns <= SELECT * FROM foreach(row=[
+      dict(Category='Auth', Pattern="(?i)[\\\\/]auth[.]json$"),
+      dict(Category='SessionIndex', Pattern="(?i)[\\\\/]session_index[.]jsonl$"),
+      dict(Category='SessionRollouts', Pattern="(?i)[\\\\/]sessions[\\\\/].*rollout-.*[.]jsonl$"),
+      dict(Category='ThreadHistory', Pattern="(?i)[\\\\/]thread_history_[0-9]+[.]sqlite"),
+      dict(Category='State', Pattern="(?i)[\\\\/]state_[0-9]+[.]sqlite"),
+      dict(Category='PluginManifests', Pattern="(?i)[\\\\/]plugins[\\\\/].*[.]codex-plugin[\\\\/]plugin[.]json$"),
+      dict(Category='Logs', Pattern="(?i)[\\\\/]log[\\\\/]|[\\\\/]logs[\\\\/]")
+      ]) WHERE IncludeAuth OR Category != 'Auth'
+      LET targets <= SELECT Category, Pattern,
+        { SELECT * FROM files WHERE OSPath =~ Pattern } AS Matches
+      FROM patterns
+      SELECT * FROM foreach(row=targets, query={
+        SELECT * FROM if(condition=len(list=Matches), then={
+          SELECT Category, RootGlob, Pattern, 'Matched' AS Status, OSPath, Size, Mtime, Ctime, Btime, Atime,
+            upload(file=OSPath, accessor=Accessor) AS Upload FROM foreach(row=Matches)
+        }, else={
+          SELECT Category, RootGlob, Pattern, 'NoMatch' AS Status FROM scope()
+        })
+      })

@@ -1,0 +1,50 @@
+name: Custom.Windows.Applications.M365Copilot.History
+description: |
+  WebView history visits from the OfficeHub profile. A visit/title is metadata,
+  not a prompt or answer. regex (RE2) filters URL or Title; empty keeps all.
+  Chromium microseconds since 1601 retained as decimal strings and normalized
+  to UTC. Specify DatabaseGlob and Accessor=file to analyze working copies.
+  Diagnostics report missing/unreadable databases and invalid regex separately.
+type: CLIENT
+precondition: |
+  SELECT OS FROM info() WHERE OS = 'windows' OR DatabaseGlob
+parameters:
+  - name: ProfileGlob
+    default: C:/Users/*
+  - name: DatabaseGlob
+    default: ""
+  - name: Accessor
+    default: ntfs
+  - name: regex
+    type: regex
+    default: ""
+sources:
+  - name: Visits
+    query: |
+      SELECT * FROM foreach(row=Files, query={
+        SELECT SourcePath, VisitId, URLId, URL, Title, VisitTimeRaw,
+          timestamp(winfiletime=atoi(string=VisitTimeRaw) * 10) AS Timestamp,
+          FromVisit, Transition, 'WebViewHistoryMetadata' AS EvidenceType
+        FROM sqlite(file=SourcePath, accessor=Accessor, query='''
+          SELECT v.id AS VisitId, u.id AS URLId, u.url AS URL, u.title AS Title,
+            CAST(v.visit_time AS TEXT) AS VisitTimeRaw, v.from_visit AS FromVisit,
+            v.transition AS Transition FROM visits v JOIN urls u ON v.url=u.id
+        ''') WHERE RegexValid AND (NOT regex OR URL =~ regex OR Title =~ regex)
+      })
+  - name: Diagnostics
+    query: |
+      SELECT * FROM if(condition=RegexValid,
+        then={ SELECT * FROM if(condition=Files,
+          then={ SELECT * FROM foreach(row=Files, query={
+            SELECT * FROM switch(
+              a={ SELECT SourcePath, 'DatabaseCounts' AS DiagnosticType, *
+                FROM sqlite(file=SourcePath, accessor=Accessor, query='SELECT (SELECT count(*) FROM visits) AS TotalVisits, (SELECT count(*) FROM urls) AS TotalURLs') },
+              b={ SELECT SourcePath, 'DATABASE_READ_OR_SCHEMA_ERROR' AS DiagnosticType FROM scope() })
+          }) },
+          else={ SELECT 'DATABASE_NOT_FOUND' AS DiagnosticType FROM scope() }) },
+        else={ SELECT 'INVALID_REGEX' AS DiagnosticType FROM scope() })
+export: |
+  LET RegexValid <= NOT regex OR '' =~ ('(?:' + regex + ')|^$')
+  LET Files = SELECT OSPath AS SourcePath FROM glob(globs=if(condition=DatabaseGlob,
+    then=DatabaseGlob,
+    else=ProfileGlob + '/AppData/Local/Packages/Microsoft.MicrosoftOfficeHub_*/LocalState/EBWebView/*/History'), accessor=Accessor)

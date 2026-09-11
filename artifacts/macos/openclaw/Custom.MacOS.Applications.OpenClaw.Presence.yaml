@@ -1,0 +1,91 @@
+name: Custom.MacOS.Applications.OpenClaw.Presence
+description: |
+  Detection de presence d'OpenClaw (ex-Clawdbot/Moltbot) sur macOS : recherche
+  du repertoire d'etat par profil (~/.openclaw ou ~/.openclaw-<profil>), du
+  LaunchAgent/LaunchDaemon ai.openclaw.*, du processus gateway et du port
+  d'ecoute local (18789 par defaut), ainsi que de l'app menu-bar native
+  /Applications/OpenClaw.app quand elle est presente.
+
+  Observe sur la cible de validation (le client de test, macOS arm64, 2026-09-10) : aucune
+  app native /Applications/OpenClaw.app installee ; OpenClaw tourne
+  uniquement comme CLI Node (paquet npm global, ici installe via Homebrew
+  node) pilote par un LaunchAgent utilisateur qui lance
+  `node .../openclaw/dist/index.js gateway --port 18789`. Ne pas supposer
+  que l'app Swift est presente sans l'observer.
+
+  Ne fait aucune lecture de contenu sensible (pas de config, pas de session).
+  Sert de premiere passe avant Custom.MacOS.Applications.OpenClaw.StateDir /
+  Config / Sessions / Auth / Memory / StateDB / Persistence / Network / TCC /
+  Logs / Collection.
+
+type: CLIENT
+
+author: Safercy DFIR (recherche Velociraptor OpenClaw)
+
+precondition: SELECT OS FROM info() WHERE OS = 'darwin'
+
+parameters:
+  - name: ProfileGlob
+    default: /Users/*
+    description: Racines de profils utilisateurs a inspecter.
+  - name: AppBundleGlob
+    default: /Applications/OpenClaw.app
+    description: Chemin(s) de l'app native macOS (LSUIElement, menu-bar).
+  - name: LaunchAgentGlobs
+    type: csv
+    default: |
+      Glob
+      /Users/*/Library/LaunchAgents/ai.openclaw.*.plist
+      /Users/*/Library/LaunchAgents/com.openclaw.*.plist
+      /Users/*/Library/LaunchAgents/*clawdbot*.plist
+      /Users/*/Library/LaunchAgents/*moltbot*.plist
+      /Library/LaunchAgents/ai.openclaw.*.plist
+      /Library/LaunchDaemons/ai.openclaw.*.plist
+    description: |
+      Motifs de LaunchAgents/LaunchDaemons. Les motifs com.openclaw.*,
+      *clawdbot*, *moltbot* couvrent les renommages historiques du produit
+      (Clawdbot -> Moltbot -> OpenClaw) ; non confirmes sur la cible de validation (seul
+      ai.openclaw.gateway a ete observe), conserves par hypothese documentee.
+  - name: PortRegex
+    type: regex
+    default: "^(18789|1879[0-9]|188[0-2][0-9])$"
+    description: Plage de ports geree par OpenClaw (gateway/control/CDP relay/browser).
+
+export: |
+  LET Profiles = SELECT OSPath AS HomeDir FROM glob(globs=ProfileGlob) WHERE IsDir
+
+sources:
+  - name: StateDirByProfile
+    query: |
+      SELECT * FROM foreach(row=Profiles, query={
+        SELECT HomeDir.Path AS UserProfile,
+               OSPath AS StateDir,
+               basename(path=OSPath) = '.openclaw' AS IsDefaultProfile,
+               Mtime, Ctime, Btime
+        FROM glob(globs=HomeDir.Path + '/.openclaw*', accessor='file')
+        WHERE IsDir
+      })
+
+  - name: AppBundle
+    query: |
+      SELECT OSPath, Btime, Mtime, IsDir
+      FROM glob(globs=AppBundleGlob)
+
+  - name: LaunchAgents
+    query: |
+      SELECT OSPath, Mtime, Size
+      FROM glob(globs=LaunchAgentGlobs.Glob)
+
+  - name: GatewayProcess
+    query: |
+      SELECT Pid, Ppid, Name, Exe, CommandLine, Username, CreateTime
+      FROM pslist()
+      WHERE Name =~ '(?i)^openclaw$' OR CommandLine =~ '(?i)openclaw/dist/index\\.js|openclaw gateway|pi-coding-agent'
+
+  - name: ListeningPorts
+    query: |
+      LET Ports = SELECT * FROM Artifact.MacOS.Network.Netstat(ConnectionStatusRegex='LISTEN')
+      SELECT Laddr, Lport, Pid, ProcInfo.Name AS ProcessName, ProcInfo.Exe AS ProcessExe, ProcInfo.CommandLine AS CommandLine
+      FROM Ports
+      WHERE format(format='%d', args=Lport) =~ PortRegex
+         OR ProcInfo.Name =~ '(?i)openclaw'

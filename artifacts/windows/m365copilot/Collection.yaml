@@ -1,0 +1,50 @@
+name: Custom.Windows.Applications.M365Copilot.Collection
+description: |
+  Raw collection of OfficeHub WebView content stores, history, telemetry,
+  package settings, manifest and Windows notifications (all applications in
+  the raw notification database). Filtering notifications happens at extraction.
+  Includes SQLite sidecars and complete selected LevelDB directories.
+  Live copies are not atomic. Do not stop the application. Upload hashes apply
+  to bytes transferred, not an atomic snapshot. Check statuses and logs.
+  regex filters SourcePath before upload; leave empty for complete selected
+  databases and their companions. This is a path filter, not a content filter.
+type: CLIENT
+precondition: |
+  SELECT OS FROM info() WHERE OS = 'windows'
+parameters:
+  - name: ProfileGlob
+    default: C:/Users/*
+  - name: regex
+    default: ""
+    type: regex
+  - name: IncludeHTTPCache
+    default: Y
+    type: bool
+  - name: IncludeNotifications
+    default: Y
+    type: bool
+  - name: MaxFileBytes
+    default: 67108864
+    type: int
+sources:
+  - name: Files
+    query: |
+      LET Profiles = SELECT UserProfile FROM chain(
+        a={ SELECT expand(path=Directory) AS UserProfile FROM Artifact.Windows.Sys.Users() },
+        b={ SELECT OSPath AS UserProfile FROM glob(globs=ProfileGlob) WHERE IsDir })
+        WHERE UserProfile GROUP BY UserProfile
+      LET Patterns = SELECT Pattern FROM chain(
+        a={ SELECT UserProfile + '/AppData/Local/Packages/Microsoft.MicrosoftOfficeHub_*/LocalState/EBWebView/Default/{IndexedDB,Local Storage,Session Storage,Service Worker,Sessions}/**10' AS Pattern FROM Profiles },
+        b={ SELECT UserProfile + '/AppData/Local/Packages/Microsoft.MicrosoftOfficeHub_*/LocalState/EBWebView/Default/{History*,Preferences,Secure Preferences}' AS Pattern FROM Profiles },
+        c={ SELECT UserProfile + '/AppData/Local/Packages/Microsoft.MicrosoftOfficeHub_*/{TempState,Settings,SystemAppData}/**6' AS Pattern FROM Profiles },
+        d={ SELECT UserProfile + '/AppData/Local/Packages/Microsoft.MicrosoftOfficeHub_*/LocalState/EBWebView/Default/Cache/**8' AS Pattern FROM Profiles WHERE IncludeHTTPCache },
+        e={ SELECT UserProfile + '/AppData/Local/Microsoft/Windows/Notifications/wpndatabase.db*' AS Pattern FROM Profiles WHERE IncludeNotifications },
+        f={ SELECT 'C:/Program Files/WindowsApps/Microsoft.MicrosoftOfficeHub_*/AppxManifest.xml' AS Pattern FROM scope() })
+      LET Files = SELECT OSPath, Size, Mtime, Ctime, Btime
+        FROM glob(globs=Patterns.Pattern, accessor='ntfs')
+        WHERE NOT IsDir AND (NOT regex OR OSPath =~ regex) GROUP BY OSPath
+      SELECT OSPath AS SourcePath, Size, Mtime, Ctime, Btime,
+        now() AS CollectionTime,
+        if(condition=Size <= MaxFileBytes, then='ATTEMPTED', else='SKIPPED_SIZE_LIMIT') AS CollectionStatus,
+        if(condition=Size <= MaxFileBytes, then=upload(file=OSPath, accessor='ntfs')) AS Upload
+      FROM Files

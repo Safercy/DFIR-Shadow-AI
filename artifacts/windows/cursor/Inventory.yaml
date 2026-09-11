@@ -1,0 +1,29 @@
+name: Custom.Windows.Applications.Cursor.Inventory
+description: |
+  Metadata inventory of Cursor user data, agent data and logs. No file uploads.
+  Depth is limited by explicit **12 globs. Extension package contents are excluded.
+  AdditionalRoots accepts custom Cursor user-data directories or .cursor roots.
+type: CLIENT
+precondition: |
+  SELECT OS FROM info() WHERE OS = 'windows'
+parameters:
+  - name: AdditionalProfileGlobs
+    default: C:/Users/*
+  - name: AdditionalRoots
+    default: ""
+sources:
+  - name: Files
+    query: |
+      LET Profiles = SELECT UserProfile FROM chain(
+        a={ SELECT expand(path=Directory) AS UserProfile FROM Artifact.Windows.Sys.Users() },
+        b={ SELECT OSPath AS UserProfile FROM glob(globs=AdditionalProfileGlobs) WHERE IsDir })
+        GROUP BY UserProfile
+      LET Roots = SELECT Root FROM chain(
+        a={ SELECT UserProfile + '/AppData/Roaming/Cursor' AS Root FROM Profiles },
+        b={ SELECT UserProfile + '/.cursor' AS Root FROM Profiles },
+        c={ SELECT _value AS Root FROM foreach(row=split(string=AdditionalRoots, sep='\n')) WHERE _value }) GROUP BY Root
+      SELECT * FROM foreach(row=Roots, query={
+        SELECT Root AS DataRoot, OSPath AS SourcePath, Name, Size, IsDir, Mtime, Ctime, Btime
+        FROM glob(globs=Root + '/**12', accessor='ntfs')
+        WHERE NOT OSPath =~ "(?i)[\\\\/]extensions[\\\\/]"
+      }) LIMIT 50000

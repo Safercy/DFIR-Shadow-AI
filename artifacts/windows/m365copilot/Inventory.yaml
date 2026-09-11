@@ -1,0 +1,51 @@
+name: Custom.Windows.Applications.M365Copilot.Inventory
+description: |
+  Targeted M365 Copilot inventory. No uploads. Package paths remain discovery
+  candidates until observed. regex filters serialized output rows (RE2 syntax,
+  empty disables filtering). Metadata only; maximum 50000 filesystem rows,
+  depth 14. Notifications inventory includes all profiles but not payloads.
+type: CLIENT
+precondition: |
+  SELECT OS FROM info() WHERE OS = 'windows'
+parameters:
+  - name: ProfileGlob
+    default: C:/Users/*
+  - name: regex
+    type: regex
+    default: ""
+export: |
+  LET Profiles = SELECT UserProfile FROM chain(
+    a={ SELECT expand(path=Directory) AS UserProfile FROM Artifact.Windows.Sys.Users() },
+    b={ SELECT OSPath AS UserProfile FROM glob(globs=ProfileGlob) WHERE IsDir })
+    WHERE UserProfile GROUP BY UserProfile
+sources:
+  - name: Processes
+    query: |
+      LET Rows = SELECT Pid, Ppid, Name, Exe, CommandLine, Username, CreateTime
+        FROM pslist() WHERE Name =~ '(?i)m365copilot|webviewhost|msedgewebview2'
+        AND (Name =~ '(?i)m365copilot' OR CommandLine =~ '(?i)m365copilot|MicrosoftOfficeHub')
+      SELECT * FROM Rows WHERE NOT regex OR serialize(item=dict(Pid=Pid, Ppid=Ppid, Name=Name, Exe=Exe, CommandLine=CommandLine, Username=Username, CreateTime=CreateTime)) =~ regex
+  - name: Packages
+    query: |
+      LET Rows = SELECT OSPath AS SourcePath, Name, Size, IsDir, Btime, Mtime
+        FROM glob(globs=['C:/Program Files/WindowsApps/Microsoft.MicrosoftOfficeHub_*',
+          'C:/Program Files/WindowsApps/Microsoft.MicrosoftOfficeHub_*/**3/M365Copilot.exe',
+          'C:/Program Files/WindowsApps/Microsoft.MicrosoftOfficeHub_*/AppxManifest.xml'], accessor='ntfs')
+      SELECT * FROM Rows WHERE NOT regex OR serialize(item=dict(SourcePath=SourcePath, Name=Name, Size=Size, IsDir=IsDir, Btime=Btime, Mtime=Mtime)) =~ regex
+  - name: Files
+    query: |
+      LET Rows = SELECT * FROM foreach(row=Profiles, query={
+        SELECT UserProfile, OSPath AS SourcePath, Name, Size, IsDir, Mtime, Ctime, Btime
+        FROM glob(globs=[UserProfile + '/AppData/Local/Packages/Microsoft.MicrosoftOfficeHub_*/**14',
+          UserProfile + '/AppData/Local/Microsoft/M365Copilot/**10',
+          UserProfile + '/AppData/Local/Microsoft/Windows/Notifications/*'], accessor='ntfs')
+      }) LIMIT 50000
+      SELECT * FROM Rows WHERE NOT regex OR serialize(item=dict(UserProfile=UserProfile, SourcePath=SourcePath, Name=Name, Size=Size, IsDir=IsDir, Mtime=Mtime, Ctime=Ctime, Btime=Btime)) =~ regex
+  - name: Prefetch
+    query: |
+      LET Rows = SELECT * FROM Artifact.Windows.Forensics.Prefetch(binaryRegex='(?i)^m365copilot[.]exe$')
+      SELECT * FROM Rows WHERE NOT regex OR serialize(item=dict(Executable=Executable, Binary=Binary, LastRunTimes=LastRunTimes, RunCount=RunCount, OSPath=OSPath)) =~ regex
+  - name: BAM
+    query: |
+      LET Rows = SELECT * FROM Artifact.Windows.Forensics.Bam() WHERE Binary =~ '(?i)m365copilot|MicrosoftOfficeHub'
+      SELECT * FROM Rows WHERE NOT regex OR serialize(item=dict(SID=SID, UserName=UserName, Binary=Binary, Bam_time=Bam_time)) =~ regex

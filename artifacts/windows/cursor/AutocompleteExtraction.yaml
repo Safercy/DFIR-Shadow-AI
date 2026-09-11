@@ -1,0 +1,105 @@
+name: Custom.Windows.Applications.Cursor.AutocompleteExtraction
+type: CLIENT
+description: |
+  Extract actual Cursor Tab model-output diffs, request logs, code-tracking hashes and daily counters.
+  Validated against Cursor 3.19.13. ModelOutput is a suggestion, not proof of acceptance.
+  Source 'tab' is observed in ai_code_hashes (not just 'autocomplete'). Hash rows are not distinct requests.
+  Log timestamps have no zone: supply LogTimezone only when established, otherwise UTC Timestamp stays null.
+  Daily counters are application-reported totals, not a per-suggestion acceptance ledger.
+  Regex covers the observed CPP Request Log/Model output format; preserve raw logs for other versions.
+parameters:
+  - name: AdditionalProfileGlobs
+    default: C:/Users/*
+  - name: DatabaseGlobs
+    default: ""
+    description: |
+      Newline-separated explicit databases. When set, replaces profile-based database discovery; supports offline copies.
+  - name: Accessor
+    default: auto
+    description: |
+      Use auto for live files/offline copies. NTFS may not preserve the same live SQLite/WAL view.
+  - name: MaxDatabaseBytes
+    default: "268435456"
+    description: |
+      Oversized databases are reported in Coverage.
+    type: int
+  - name: TabLogGlobs
+    default: ""
+    description: |
+      Newline-separated explicit Tab logs; overrides discovery.
+  - name: MaxLogBytes
+    default: "16777216"
+    description: |
+      Whole-file parsing bound; larger logs reported as skipped.
+    type: int
+  - name: LogTimezone
+    default: ""
+    description: |
+      IANA zone for log timestamps, e.g. Europe/Paris; blank preserves raw only.
+precondition: |
+  SELECT OS FROM info() WHERE OS = 'windows' OR DatabaseGlobs OR TabLogGlobs
+export: |
+
+  LET Profiles = SELECT UserProfile FROM chain(
+    a={ SELECT expand(path=Directory) AS UserProfile FROM Artifact.Windows.Sys.Users() },
+    b={ SELECT OSPath AS UserProfile FROM glob(globs=AdditionalProfileGlobs) WHERE IsDir }) GROUP BY UserProfile
+  LET Databases = SELECT * FROM if(condition=DatabaseGlobs,
+    then={ SELECT OSPath AS DBPath, NULL AS UserProfile, Size FROM glob(globs=split(string=DatabaseGlobs, sep='\n'), accessor=Accessor) WHERE NOT IsDir },
+    else={ SELECT * FROM foreach(row=Profiles, query={
+      SELECT OSPath AS DBPath, UserProfile, Size FROM glob(globs=[
+        UserProfile + '/AppData/Roaming/Cursor/User/globalStorage/state.vscdb',
+        UserProfile + '/AppData/Roaming/Cursor/User/workspaceStorage/*/state.vscdb',
+        UserProfile + '/.cursor/ai-tracking/ai-code-tracking.db',
+        UserProfile + '/AppData/Roaming/Cursor/User/globalStorage/conversation-search.db',
+        UserProfile + '/AppData/Roaming/Cursor/snapshots/state/state.db'], accessor=Accessor) WHERE NOT IsDir }) })
+  LET Rows(Table, SQL) = SELECT * FROM foreach(row={SELECT * FROM Databases WHERE Size <= MaxDatabaseBytes}, query={
+    SELECT * FROM if(condition={SELECT name FROM sqlite(file=DBPath,accessor=Accessor,query="SELECT name FROM sqlite_master WHERE type='table'") WHERE name = Table},
+      then={SELECT DBPath AS SourcePath, UserProfile, * FROM sqlite(file=DBPath,accessor=Accessor,query=SQL)}) })
+
+  LET PARSE_TZ <= LogTimezone
+  LET TabLogs = SELECT * FROM if(condition=TabLogGlobs,
+   then={ SELECT OSPath AS LogPath, NULL AS UserProfile, Size FROM glob(globs=split(string=TabLogGlobs,sep='\n'),accessor=Accessor) WHERE NOT IsDir },
+   else={ SELECT * FROM foreach(row=Profiles,query={ SELECT OSPath AS LogPath, UserProfile, Size FROM glob(globs=UserProfile + '/AppData/Roaming/Cursor/logs/**10/Cursor Tab*.log',accessor=Accessor) WHERE NOT IsDir }) })
+sources:
+  - name: Coverage
+    query: |
+
+      LET SchemaRows = SELECT DBPath AS SourcePath, UserProfile, Size,
+        { SELECT name FROM sqlite(file=DBPath,accessor=Accessor,query="SELECT name FROM sqlite_master WHERE type='table'") } AS TableList
+        FROM Databases WHERE Size <= MaxDatabaseBytes
+      SELECT * FROM chain(
+       a={SELECT SourcePath,UserProfile,Size,TableList.name AS Tables,
+         if(condition=TableList,then='TABLES_READ',else='NO_TABLES_OR_READ_ERROR_CHECK_LOGS') AS Status FROM SchemaRows},
+       b={SELECT DBPath AS SourcePath,UserProfile,Size,'SKIPPED_SIZE_LIMIT' AS Status FROM Databases WHERE Size > MaxDatabaseBytes})
+  - name: ModelOutput
+    query: |
+      SELECT * FROM foreach(row={SELECT * FROM TabLogs WHERE Size <= MaxLogBytes},query={
+       SELECT LogPath AS SourcePath, UserProfile, RequestId, TimestampRaw,
+        if(condition=LogTimezone,then=timestamp(string=TimestampRaw,format='2006-01-02 15:04:05.000')) AS Timestamp,
+        LogTimezone AS Timezone, Content,
+        parse_string_with_regex(string=Content,regex='@@ (?P<File>[^\r\n]+)').File AS TargetLocation,
+        if(condition=Content =~ '@@',then='DIFF_PRESENT',else='EMPTY_OUTPUT') AS OutputStatus,
+        'NOT_ESTABLISHED_BY_LOG' AS AcceptanceStatus, 'CursorTab/ModelOutput' AS ExtractionMethod
+       FROM parse_records_with_regex(file=LogPath,accessor=Accessor,buffer_size=MaxLogBytes,regex="(?m)^(?P<TimestampRaw>\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}\\.\\d{3}) \\[info\\] CPP Request Log with id (?P<RequestId>[0-9a-fA-F-]+)\\r?\\n[^\\n]*=======>Model output[^\\n]*\\n(?P<Content>(?:(?:@@[^\\n]*|[+ -]\\|[^\\n]*)(?:\\n|$)|\\r?\\n)*)") })
+  - name: RequestEvents
+    query: |
+
+      SELECT * FROM foreach(row={SELECT * FROM TabLogs WHERE Size <= MaxLogBytes},query={
+       SELECT LogPath AS SourcePath, UserProfile, count() AS MatchOrdinal, Line
+       FROM parse_lines(filename=LogPath,accessor=Accessor,buffer_size=MaxLogBytes)
+       WHERE Line =~ '(?i)requestId|CPP Request Log|Done streaming cpp|Error in streaming|accept|reject' })
+  - name: Tracking
+    query: |
+      SELECT * FROM Rows(Table='ai_code_hashes',SQL="SELECT hash,source,fileExtension,fileName,requestId,conversationId,timestamp AS TimestampRaw,model,createdAt AS CreatedAtRaw FROM ai_code_hashes WHERE lower(source) IN ('tab','autocomplete')")
+  - name: DailyStatistics
+    query: |
+
+      LET Stats = SELECT SourcePath, UserProfile, SourceKey, parse_json(data=RawJSON) AS S
+      FROM Rows(Table='ItemTable',SQL="SELECT key AS SourceKey,CAST(value AS TEXT) AS RawJSON FROM ItemTable WHERE key LIKE 'aiCodeTracking.dailyStats.%' AND json_valid(value)")
+      SELECT SourcePath, UserProfile, SourceKey, S.date AS Date,
+       S.tabSuggestedLines AS TabSuggestedLines, S.tabAcceptedLines AS TabAcceptedLines,
+       S.composerSuggestedLines AS ComposerSuggestedLines,S.composerAcceptedLines AS ComposerAcceptedLines,
+       'APPLICATION_REPORTED_COUNTERS' AS EvidenceType FROM Stats
+  - name: LogCoverage
+    query: |
+      SELECT LogPath AS SourcePath,UserProfile,Size,if(condition=Size > MaxLogBytes,then='SKIPPED_SIZE_LIMIT',else='PARSE_ATTEMPTED_CHECK_RAW_LOG_FOR_UNMATCHED_FORMAT') AS Status FROM TabLogs

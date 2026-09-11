@@ -1,0 +1,175 @@
+name: Custom.MacOS.Applications.OpenClaw.Logs
+description: |
+  Journaux OpenClaw hors configuration (voir Custom...Config pour
+  logs/config-audit.jsonl) : logs quotidiens JSON /tmp/openclaw/*.log
+  (volatils, purge au-dela de 24h selon le dossier de recherche -- a
+  collecter rapidement), le log stdout du LaunchAgent
+  ~/Library/Logs/openclaw/gateway.log (texte libre, pas du JSON ligne a
+  ligne), et les paquets d'incident ~/.openclaw/logs/stability/*.json.
+
+  Observe sur la cible de validation (2026-09-10) : /private/tmp/openclaw/openclaw-2026-09-09.log
+  et openclaw-2026-09-10.log presents (accessor 'file' fonctionne sur
+  /private/tmp, alias de /tmp sur macOS). Schema JSON CONFIRME (logger de
+  type tslog cote Node) : chaque ligne a `time` (ISO), `hostname` (nom
+  reseau macOS reel, ex. "nom macOS observe" -- attention, DIFFERENT
+  du hostname rapporte par l'agent Velociraptor lui-meme ;
+  utile pour recouper une identite machine), `message`, et un objet `_meta`
+  avec `_meta.name` = une CHAINE JSON imbriquee du type '{"subsystem":"gateway"}'
+  (a re-parser avec parse_json), `_meta.logLevelName`, `_meta.date`, et
+  `_meta.path.filePathWithLine` (fichier/ligne source Node ayant emis le
+  log, utile pour identifier la version/le build exact). Pas de champ
+  `subsystem` au premier niveau contrairement a l'hypothese initiale.
+  ~/Library/Logs/openclaw/gateway.log confirme present (StandardOutPath du
+  plist) : simple texte horodate ligne par ligne ("<ISO8601> [gateway] ..."),
+  PAS du JSON -- chemin non documente dans le dossier de recherche initial
+  (Etat: observe). L'horodatage en tete de ligne est extrait dans EventTime
+  pour permettre le filtrage temporel ; une ligne sans horodatage
+  reconnaissable (continuation, trace d'exception) sort avec EventTime=NULL
+  et Undated=true, et elle est CONSERVEE meme quand une fenetre temporelle
+  est active -- on ne peut pas la dater, on ne la jette donc pas
+  silencieusement ; a l'analyste de decider via la colonne Undated. De nombreux fichiers
+  logs/stability/*-gateway.startup_failed.json ont ete generes toutes les
+  ~10 secondes pendant le test (indice d'un incident de demarrage repete au
+  moment de la collecte, cf. Persistence.yaml) ; ils sont rotates/nettoyes
+  rapidement par le produit lui-meme (un seul reste souvent disponible),
+  donc DoNotAssumeCompleteness = vrai pour cette source.
+
+  Les logs JSON sont lus ligne a ligne (parse_lines + parse_json) plutot
+  qu'avec parse_jsonl : une ligne malformee ou tronquee n'interrompt pas la
+  collecte MAIS est explicitement signalee (ParseError=true,
+  ParseErrorSample = 200 premiers octets, LineNumber), au lieu d'etre
+  silencieusement absente du resultat. Une telle ligne n'a pas
+  d'horodatage exploitable : elle est donc CONSERVEE meme quand une fenetre
+  temporelle est active, au meme titre que les lignes Undated du log stdout
+  -- sinon le filtre temporel ferait disparaitre en silence exactement les
+  lignes corrompues qu'il faut voir. Cas courant et attendu : la derniere
+  ligne d'un log en cours d'ecriture est tronquee. Ce n'est pas une garantie
+  d'exhaustivite du fichier lui-meme (rotation/purge cote produit).
+
+  VOLUMETRIE -- MESUREE SUR LA CIBLE, DEUX FOIS :
+
+    * une collecte de validation, MaxRows=100000 -> DailyJsonLogs 100000 +
+      GatewayStdoutLog 100000 + StabilityBundles 20 = 200 020 lignes pour UN
+      SEUL client, les deux premieres sources SATUREES.
+    * une collecte de validation, MaxRows abaisse a 20000 -> 20000 + 20000 + 20 :
+      LES DEUX SOURCES SATURENT TOUJOURS.
+
+  Conclusion mesuree : baisser le plafond de lignes NE REGLE RIEN, cela
+  tronque simplement plus tot. Sur cette machine les journaux depassent de
+  loin n'importe quel plafond raisonnable (gateway en boucle de redemarrage
+  qui ecrit en continu). Le bon levier est une FENETRE TEMPORELLE
+  (EventsAfter / EventsBefore), appliquee AVANT le plafond.
+
+  PIEGE ASSOCIE -- SENS DE LA TRONCATURE : le plafond garde les PREMIERES
+  lignes lues, donc les PLUS ANCIENNES. Sur un log volumineux, collecter sans
+  fenetre temporelle rend les plus vieilles lignes et fait disparaitre
+  l'activite recente, qui est presque toujours celle qui interesse une
+  investigation. Toujours poser EventsAfter plutot que de se fier au plafond.
+
+  CE QUE LA FENETRE NE RESOUT PAS -- COUT CLIENT : le filtre s'applique apres
+  lecture, ligne par ligne. Mesure sur la cible (une collecte de validation,
+  EventsAfter a -6 h) : 20 lignes rendues au total, mais RowsScanned
+  = 5 907 920 et 25 s d'execution cote client. La fenetre protege le SERVEUR
+  et l'analyste du bruit, elle ne protege PAS le poste de la lecture
+  integrale des fichiers. Pour reduire aussi le cout client, restreindre
+  TmpLogGlob a la ou les journees voulues (les fichiers sont nommes
+  openclaw-YYYY-MM-DD.log) plutot que de compter sur EventsAfter seul.
+
+type: CLIENT
+
+author: Safercy DFIR (recherche Velociraptor OpenClaw)
+
+precondition: SELECT OS FROM info() WHERE OS = 'darwin'
+
+parameters:
+  - name: ProfileGlob
+    default: /Users/*
+  - name: TmpLogGlob
+    default: "/private/tmp/openclaw/*.log,/private/tmp/openclaw/*.*.log"
+  - name: EventsAfter
+    type: timestamp
+    default: ""
+    description: |
+      Ne renvoyer que les evenements STRICTEMENT POSTERIEURS a cet instant.
+      C'est le levier principal de volumetrie : il s'applique AVANT MaxRows,
+      donc il choisit QUELLES lignes sont gardees au lieu de subir la
+      troncature par le debut. Laisser vide desactive le filtre.
+  - name: EventsBefore
+    type: timestamp
+    default: ""
+    description: Ne renvoyer que les evenements strictement anterieurs a cet instant.
+  - name: MaxRows
+    type: int64
+    default: 20000
+    description: |
+      Garde-fou de dernier recours PAR SOURCE, applique APRES la fenetre
+      temporelle. REGLE DE LECTURE : si une source rend exactement MaxRows
+      lignes, considerer le resultat comme TRONQUE et non comme complet --
+      resserrer EventsAfter/EventsBefore plutot que d'augmenter ce plafond.
+      Mesure sur la cible : sans fenetre temporelle, DailyJsonLogs et
+      GatewayStdoutLog saturent aussi bien a 20000 qu'a 100000.
+      Il n'y a volontairement pas de colonne Truncated : count() est un
+      agregat a etat en VQL et l'appeler une seconde fois dans la meme ligne
+      fausserait le comptage.
+
+sources:
+  - name: DailyJsonLogs
+    query: |
+      LET Files = SELECT OSPath, Mtime, Size FROM glob(globs=split(string=TmpLogGlob, sep=','), accessor='file')
+
+      LET AllLines = SELECT * FROM foreach(row=Files, query={
+        SELECT OSPath AS SourcePath, count() AS LineNumber,
+               Line, parse_json(data=Line) AS Row
+        FROM parse_lines(filename=OSPath)
+      })
+
+      LET Parsed = SELECT SourcePath, LineNumber, Line, Row,
+             if(condition=Row.time, then=timestamp(string=Row.time)) AS EventTime
+      FROM AllLines
+      WHERE len(list=Line) > 0
+
+      SELECT SourcePath, LineNumber, EventTime,
+             Row.time AS EventTimeRaw,
+             Row.hostname AS Hostname,
+             Row._meta.logLevelName AS Level,
+             parse_json(data=Row._meta.name).subsystem AS Subsystem,
+             Row.message AS Message,
+             Row._meta.path.filePathWithLine AS SourceCodeLocation,
+             Row = NULL AS ParseError,
+             if(condition=Row = NULL, then=substr(str=Line, start=0, end=200)) AS ParseErrorSample
+      FROM Parsed
+      WHERE (NOT EventsAfter OR EventTime = NULL OR EventTime > EventsAfter)
+        AND (NOT EventsBefore OR EventTime = NULL OR EventTime < EventsBefore)
+        AND count() <= MaxRows
+
+  - name: GatewayStdoutLog
+    query: |
+      LET Files = SELECT * FROM foreach(row={ SELECT OSPath AS HomeDir FROM glob(globs=ProfileGlob) WHERE IsDir }, query={
+        SELECT HomeDir.Path AS UserProfile, OSPath, Mtime, Size
+        FROM glob(globs=HomeDir.Path + '/Library/Logs/openclaw/gateway.log', accessor='file')
+      })
+
+      LET Parsed = SELECT * FROM foreach(row=Files, query={
+        SELECT UserProfile, OSPath AS SourcePath, Mtime, Size, Line,
+               if(condition=Line =~ '^\\d{4}-\\d{2}-\\d{2}T',
+                  then=timestamp(string=regex_replace(source=Line, re='^(\\S+).*$', replace='$1'))) AS EventTime
+        FROM parse_lines(filename=OSPath)
+      })
+
+      SELECT UserProfile, SourcePath, Mtime, Size, EventTime,
+             EventTime = NULL AS Undated, Line
+      FROM Parsed
+      WHERE (NOT EventsAfter OR EventTime = NULL OR EventTime > EventsAfter)
+        AND (NOT EventsBefore OR EventTime = NULL OR EventTime < EventsBefore)
+        AND count() <= MaxRows
+
+  - name: StabilityBundles
+    query: |
+      LET Files = SELECT * FROM foreach(row={ SELECT OSPath AS HomeDir FROM glob(globs=ProfileGlob) WHERE IsDir }, query={
+        SELECT HomeDir.Path AS UserProfile, OSPath, Mtime
+        FROM glob(globs=HomeDir.Path + '/.openclaw*/logs/stability/*.json', accessor='file')
+      })
+
+      SELECT UserProfile, OSPath AS SourcePath, Mtime,
+             parse_json(data=read_file(filename=OSPath)) AS Content
+      FROM Files

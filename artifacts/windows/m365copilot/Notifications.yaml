@@ -1,0 +1,91 @@
+name: Custom.Windows.Applications.M365Copilot.Notifications
+description: |
+  Extract Windows notification payloads and handler registrations for M365.
+  Tested schema: Notification.HandlerId -> NotificationHandler.RecordId.
+  ApplicationRegex matches sender PrimaryId, ParentId OR UTF-8 XML payload:
+  a Store installation toast can concern M365 without being emitted by M365.
+  MatchBasis distinguishes sender from payload attribution. A handler row is
+  registration evidence, not proof a notification was displayed.
+  regex is an additional RE2 filter on Content and application identifiers.
+  Empty regex returns all M365 matches. Matching is substring by default;
+  use anchors for full matches, (?i) for case folding, (?s) for multiline dot.
+  No carving of deleted records. Raw BLOB preserved as hex. UTF-8 XML observed;
+  other encodings require offline decoding. Arrival/Expiry are FILETIME;
+  raw decimal strings are retained without floating-point rounding.
+  Diagnostics are intentionally unfiltered and contain no notification content.
+  For offline analysis specify DatabaseGlob pointing to working copies with
+  WAL/SHM companions and Accessor=file. Live reads are not atomic snapshots.
+type: CLIENT
+precondition: |
+  SELECT OS FROM info() WHERE OS = 'windows' OR DatabaseGlob
+parameters:
+  - name: ProfileGlob
+    default: C:/Users/*
+  - name: DatabaseGlob
+    default: ""
+  - name: Accessor
+    default: ntfs
+  - name: ApplicationRegex
+    type: regex
+    default: (?i)m365copilot|microsoft[ .]?365|Microsoft[.]MicrosoftOfficeHub|copilot[.]cloud[.]microsoft
+  - name: regex
+    type: regex
+    default: ""
+export: |
+  LET RegexValid <= NOT regex OR '' =~ ('(?:' + regex + ')|^$')
+  LET ApplicationRegexValid <= '' =~ ('(?:' + ApplicationRegex + ')|^$')
+  LET Profiles = SELECT UserProfile FROM chain(
+    a={ SELECT expand(path=Directory) AS UserProfile FROM Artifact.Windows.Sys.Users() },
+    b={ SELECT OSPath AS UserProfile FROM glob(globs=ProfileGlob) WHERE IsDir })
+    WHERE UserProfile GROUP BY UserProfile
+  LET Databases = SELECT SourcePath FROM if(condition=DatabaseGlob,
+    then={ SELECT OSPath AS SourcePath FROM glob(globs=DatabaseGlob, accessor=Accessor) WHERE NOT IsDir },
+    else={ SELECT * FROM foreach(row=Profiles, query={
+      SELECT OSPath AS SourcePath FROM glob(globs=UserProfile + '/AppData/Local/Microsoft/Windows/Notifications/wpndatabase.db', accessor=Accessor)
+    }) }) GROUP BY SourcePath
+sources:
+  - name: Notifications
+    query: |
+      LET Rows = SELECT * FROM foreach(row=Databases, query={
+        SELECT SourcePath,
+          NotificationId, HandlerId, PrimaryId, ParentId, Type, PayloadType,
+          Content, PayloadHex, Tag, NotificationGroup,
+          ArrivalTimeRaw, ExpiryTimeRaw,
+          if(condition=atoi(string=ArrivalTimeRaw) > 0, then=timestamp(winfiletime=atoi(string=ArrivalTimeRaw))) AS Timestamp,
+          if(condition=PrimaryId =~ ApplicationRegex OR ParentId =~ ApplicationRegex,
+             then='SenderIdentity', else='PayloadReference') AS MatchBasis,
+          'SQLite.Notification+NotificationHandler' AS ExtractionMethod
+        FROM sqlite(file=SourcePath, accessor=Accessor, query='''
+          SELECT n.Id AS NotificationId, n.HandlerId, h.PrimaryId, h.ParentId,
+            n.Type, n.PayloadType, CAST(n.Payload AS TEXT) AS Content,
+            hex(n.Payload) AS PayloadHex, n.Tag, n.[Group] AS NotificationGroup,
+            CAST(n.ArrivalTime AS TEXT) AS ArrivalTimeRaw,
+            CAST(n.ExpiryTime AS TEXT) AS ExpiryTimeRaw
+          FROM Notification n LEFT JOIN NotificationHandler h ON n.HandlerId=h.RecordId
+        ''')
+        WHERE PrimaryId =~ ApplicationRegex OR ParentId =~ ApplicationRegex OR Content =~ ApplicationRegex
+      })
+      SELECT * FROM Rows
+      WHERE RegexValid AND ApplicationRegexValid AND (NOT regex OR Content =~ regex OR PrimaryId =~ regex OR ParentId =~ regex)
+  - name: Handlers
+    query: |
+      SELECT * FROM foreach(row=Databases, query={
+        SELECT SourcePath, RecordId AS HandlerId, PrimaryId, ParentId,
+          CreatedTime AS CreatedTimeRaw, ModifiedTime AS ModifiedTimeRaw,
+          'HandlerRegistration' AS EvidenceType
+        FROM sqlite(file=SourcePath, accessor=Accessor, query='SELECT RecordId, PrimaryId, ParentId, CAST(CreatedTime AS TEXT) AS CreatedTime, CAST(ModifiedTime AS TEXT) AS ModifiedTime FROM NotificationHandler')
+        WHERE RegexValid AND ApplicationRegexValid AND (PrimaryId =~ ApplicationRegex OR ParentId =~ ApplicationRegex)
+          AND (NOT regex OR PrimaryId =~ regex OR ParentId =~ regex)
+      })
+  - name: Diagnostics
+    query: |
+      SELECT * FROM if(condition=RegexValid AND ApplicationRegexValid,
+        then={ SELECT * FROM if(condition=Databases,
+        then={ SELECT * FROM foreach(row=Databases, query={
+          SELECT * FROM switch(
+            a={ SELECT SourcePath, 'DatabaseCounts' AS DiagnosticType, *
+              FROM sqlite(file=SourcePath, accessor=Accessor, query='SELECT (SELECT count(*) FROM Notification) AS TotalNotifications, (SELECT count(*) FROM NotificationHandler) AS TotalHandlers') },
+            b={ SELECT SourcePath, 'DATABASE_READ_OR_SCHEMA_ERROR' AS DiagnosticType FROM scope() })
+        }) },
+        else={ SELECT 'DATABASE_NOT_FOUND' AS DiagnosticType FROM scope() }) },
+        else={ SELECT 'INVALID_REGEX' AS DiagnosticType FROM scope() })

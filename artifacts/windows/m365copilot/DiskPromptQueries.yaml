@@ -1,0 +1,79 @@
+name: Custom.Windows.Applications.M365Copilot.DiskPromptQueries
+description: |
+  Client-side disk extraction of URL-encoded prompt/search text from OfficeHub
+  WebView History. Parses SQLite and URL q parameters on the endpoint, returning
+  decoded Content only with provenance; no raw database upload, memory scan,
+  Python or external parser required. This source is a recorded URL query,
+  not proof of a submitted chat message. Titles are never returned as prompts.
+  Coverage demonstrated: microsoft365.com/hwav2/search/main?q=... .
+  Does not recover assistant responses or prompts absent from History URLs.
+  Copies History and available WAL/SHM into a temporary directory before SQLite
+  reading. Copies of an active database are not atomic; errors remain in logs.
+  SourcePath is the original database; Timestamp is navigation time, not message
+  time. Raw Chromium microseconds since 1601 are retained as decimal strings.
+  regex (RE2) applies only to decoded Content; empty retains all extracted text.
+  Diagnostics are separate and contain no prompts. Temporary copies are removed
+  at query teardown. DatabaseGlob and Accessor=file allow offline fixture tests.
+type: CLIENT
+precondition: |
+  SELECT OS FROM info() WHERE OS = 'windows' OR DatabaseGlob
+parameters:
+  - name: ProfileGlob
+    default: C:/Users/*
+  - name: DatabaseGlob
+    default: ""
+  - name: Accessor
+    default: ntfs
+  - name: regex
+    type: regex
+    default: ""
+export: |
+  LET RegexValid <= NOT regex OR '' =~ ('(?:' + regex + ')|^$')
+  LET Files <= SELECT OSPath AS SourcePath,
+    tempdir(remove_last=TRUE) AS WorkingDir
+    FROM glob(globs=if(condition=DatabaseGlob, then=DatabaseGlob,
+      else=ProfileGlob + '/AppData/Local/Packages/Microsoft.MicrosoftOfficeHub_*/LocalState/EBWebView/*/History'), accessor=Accessor)
+    WHERE NOT IsDir AND RegexValid
+  LET Copies <= SELECT * FROM foreach(row=Files, query={
+    SELECT SourcePath, OSPath AS CompanionPath,
+      copy(filename=OSPath, accessor=Accessor, dest=WorkingDir + '/' + basename(path=OSPath)) AS CopiedPath
+    FROM glob(globs=[format(format='%v', args=[SourcePath]),
+      format(format='%v-wal', args=[SourcePath]), format(format='%v-shm', args=[SourcePath])], accessor=Accessor)
+    WHERE NOT IsDir
+  })
+  LET Visits = SELECT * FROM foreach(row=Files, query={
+    SELECT SourcePath, VisitId, URLId, URL, VisitTimeRaw
+    FROM sqlite(file=WorkingDir + '/' + basename(path=SourcePath), accessor='file', query='''
+      SELECT v.id AS VisitId, u.id AS URLId, u.url AS URL,
+        CAST(v.visit_time AS TEXT) AS VisitTimeRaw
+      FROM visits v JOIN urls u ON v.url=u.id
+    ''')
+    WHERE URL =~ '(?i)^https://(www[.])?microsoft365[.]com/hwav2/search/main[?]'
+  })
+sources:
+  - name: Prompts
+    query: |
+      SELECT * FROM foreach(row=Visits, query={
+        SELECT SourcePath, VisitId, URLId,
+          _value AS Content, 'URLQueryText' AS EvidenceType,
+          NULL AS Role, NULL AS ConversationId, NULL AS MessageId,
+          VisitTimeRaw,
+          timestamp(winfiletime=atoi(string=VisitTimeRaw) * 10) AS Timestamp,
+          'NavigationTime' AS TimestampMeaning,
+          'SQLite.History.URL.Query.q' AS ExtractionMethod
+        FROM foreach(row=url(parse=URL).Query.q)
+        WHERE _value AND (NOT regex OR _value =~ regex)
+      })
+  - name: Diagnostics
+    query: |
+      SELECT * FROM if(condition=RegexValid, then={
+        SELECT * FROM if(condition=Files, then={
+          SELECT * FROM foreach(row=Files, query={
+            SELECT * FROM switch(
+              a={ SELECT SourcePath, 'DatabaseCounts' AS DiagnosticType, *
+                FROM sqlite(file=WorkingDir + '/' + basename(path=SourcePath), accessor='file',
+                  query='SELECT (SELECT count(*) FROM visits) AS TotalVisits, (SELECT count(*) FROM urls) AS TotalURLs') },
+              b={ SELECT SourcePath, 'DATABASE_READ_OR_COPY_ERROR' AS DiagnosticType FROM scope() })
+          })
+        }, else={ SELECT 'DATABASE_NOT_FOUND' AS DiagnosticType FROM scope() })
+      }, else={ SELECT 'INVALID_REGEX' AS DiagnosticType FROM scope() })

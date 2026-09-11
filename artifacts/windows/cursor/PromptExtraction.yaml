@@ -1,0 +1,143 @@
+name: Custom.Windows.Applications.Cursor.PromptExtraction
+type: CLIENT
+description: |
+  Extract Cursor conversations, tool events, session metadata and legacy prompt history.
+  Validated schema: Cursor 3.19.13. Source layers deliberately remain separate.
+  Bubbles type 2 include tool/thinking events, not just textual assistant replies.
+  JSON agentKv blobs have no proven session linkage; binary blobs are inventoried only.
+  Use Collection first for preserved DB/WAL/SHM evidence. Live sqlite() is best-effort.
+  No records means no matching source, not no Cursor use. Inspect Coverage and logs.
+  Transcript status/error rows are preserved; JSONL line numbers are source positions.
+  Collection-wide row/time limits must be set by the operator.
+parameters:
+  - name: AdditionalProfileGlobs
+    default: C:/Users/*
+  - name: DatabaseGlobs
+    default: ""
+    description: |
+      Newline-separated explicit databases. When set, replaces profile-based database discovery; supports offline copies.
+  - name: Accessor
+    default: auto
+    description: |
+      Use auto for live files/offline copies. NTFS may not preserve the same live SQLite/WAL view.
+  - name: MaxDatabaseBytes
+    default: "268435456"
+    description: |
+      Oversized databases are reported in Coverage.
+    type: int
+  - name: TranscriptGlobs
+    default: ""
+    description: |
+      Newline-separated transcript paths/globs; overrides discovery.
+  - name: MaxTextFileBytes
+    default: "33554432"
+    description: |
+      Larger transcripts are skipped and reported.
+    type: int
+precondition: |
+  SELECT OS FROM info() WHERE OS = 'windows' OR DatabaseGlobs OR TranscriptGlobs
+export: |
+
+  LET Profiles = SELECT UserProfile FROM chain(
+    a={ SELECT expand(path=Directory) AS UserProfile FROM Artifact.Windows.Sys.Users() },
+    b={ SELECT OSPath AS UserProfile FROM glob(globs=AdditionalProfileGlobs) WHERE IsDir }) GROUP BY UserProfile
+  LET Databases = SELECT * FROM if(condition=DatabaseGlobs,
+    then={ SELECT OSPath AS DBPath, NULL AS UserProfile, Size FROM glob(globs=split(string=DatabaseGlobs, sep='\n'), accessor=Accessor) WHERE NOT IsDir },
+    else={ SELECT * FROM foreach(row=Profiles, query={
+      SELECT OSPath AS DBPath, UserProfile, Size FROM glob(globs=[
+        UserProfile + '/AppData/Roaming/Cursor/User/globalStorage/state.vscdb',
+        UserProfile + '/AppData/Roaming/Cursor/User/workspaceStorage/*/state.vscdb',
+        UserProfile + '/.cursor/ai-tracking/ai-code-tracking.db',
+        UserProfile + '/AppData/Roaming/Cursor/User/globalStorage/conversation-search.db',
+        UserProfile + '/AppData/Roaming/Cursor/snapshots/state/state.db'], accessor=Accessor) WHERE NOT IsDir }) })
+  LET Rows(Table, SQL) = SELECT * FROM foreach(row={SELECT * FROM Databases WHERE Size <= MaxDatabaseBytes}, query={
+    SELECT * FROM if(condition={SELECT name FROM sqlite(file=DBPath,accessor=Accessor,query="SELECT name FROM sqlite_master WHERE type='table'") WHERE name = Table},
+      then={SELECT DBPath AS SourcePath, UserProfile, * FROM sqlite(file=DBPath,accessor=Accessor,query=SQL)}) })
+
+  LET Transcripts = SELECT * FROM if(condition=TranscriptGlobs,
+   then={ SELECT OSPath AS TranscriptPath, NULL AS UserProfile, Size FROM glob(globs=split(string=TranscriptGlobs,sep='\n'),accessor=Accessor) WHERE NOT IsDir },
+   else={ SELECT * FROM foreach(row=Profiles,query={ SELECT OSPath AS TranscriptPath, UserProfile, Size FROM glob(globs=UserProfile + '/.cursor/projects/*/agent-transcripts/**8/*.jsonl',accessor=Accessor) WHERE NOT IsDir }) })
+sources:
+  - name: Coverage
+    query: |
+
+      LET SchemaRows = SELECT DBPath AS SourcePath, UserProfile, Size,
+        { SELECT name FROM sqlite(file=DBPath,accessor=Accessor,query="SELECT name FROM sqlite_master WHERE type='table'") } AS TableList
+        FROM Databases WHERE Size <= MaxDatabaseBytes
+      SELECT * FROM chain(
+       a={SELECT SourcePath,UserProfile,Size,TableList.name AS Tables,
+         if(condition=TableList,then='TABLES_READ',else='NO_TABLES_OR_READ_ERROR_CHECK_LOGS') AS Status FROM SchemaRows},
+       b={SELECT DBPath AS SourcePath,UserProfile,Size,'SKIPPED_SIZE_LIMIT' AS Status FROM Databases WHERE Size > MaxDatabaseBytes})
+  - name: Messages
+    query: |
+
+      LET Bubbles = SELECT SourcePath, UserProfile, SourceKey, parse_json(data=RawJSON) AS B
+      FROM Rows(Table='cursorDiskKV',SQL="SELECT key AS SourceKey, CAST(value AS TEXT) AS RawJSON FROM cursorDiskKV WHERE key LIKE 'bubbleId:%' AND json_valid(value)")
+      SELECT SourcePath, UserProfile, SourceKey, split(string=SourceKey,sep=':')[1] AS ConversationId,
+        B.bubbleId AS MessageId, B.type AS Type,
+        if(condition=B.type = 1,then='user',else=if(condition=B.type = 2,then='assistant',else='unknown')) AS Role,
+        if(condition=B.toolFormerData,then='tool_event',else=if(condition=B.thinking,then='thinking_event',else='message')) AS RecordKind,
+        B.createdAt AS TimestampRaw, if(condition=B.createdAt,then=timestamp(string=B.createdAt)) AS Timestamp,
+        B.text AS Content, B.requestId AS RequestId, B.modelInfo.modelName AS Model,
+        B.toolFormerData.name AS ToolName, B.toolFormerData AS ToolData, B.thinking AS Thinking,
+        B.context AS Context, B.relevantFiles AS RelevantFiles, B.images AS Images,
+        B.tokenCount AS TokenCount, 'cursorDiskKV/bubbleId' AS ExtractionMethod
+      FROM Bubbles
+  - name: SearchIndex
+    query: |
+      SELECT * FROM Rows(Table='conversation_fts_content',SQL="SELECT c.id AS ConversationId,c.source AS IndexSource,c.scope AS IndexScope,c.updated_at AS UpdatedAtRaw,c.is_archived AS IsArchived,f.id AS SourceRowId,f.c0 AS Title,f.c1 AS Content,f.c2 AS Branches,'FLATTENED_SEARCH_INDEX_NOT_ROLE_SEPARATED' AS Interpretation FROM conversation_fts_content f LEFT JOIN conversations c ON c.fts_rowid=f.id")
+  - name: Sessions
+    query: |
+
+      LET Sessions = SELECT SourcePath, UserProfile, SourceKey, parse_json(data=RawJSON) AS S
+      FROM Rows(Table='cursorDiskKV',SQL="SELECT key AS SourceKey, CAST(value AS TEXT) AS RawJSON FROM cursorDiskKV WHERE key LIKE 'composerData:%' AND json_valid(value)")
+      SELECT SourcePath, UserProfile, SourceKey, S.composerId AS ConversationId, S.name AS Title,
+        S.createdAt AS CreatedAtRaw, if(condition=S.createdAt,then=timestamp(epoch=S.createdAt)) AS CreatedAt,
+        S.lastUpdatedAt AS LastUpdatedAtRaw, S.modelConfig.modelName AS Model, S.isDraft AS IsDraft,
+        S.workspaceIdentifier AS Workspace, S.subagentInfo AS SubagentInfo,
+        S.fullConversationHeadersOnly AS MessageOrder, S.totalLinesAdded AS LinesAdded,
+        S.totalLinesRemoved AS LinesRemoved, S.status AS Status, 'composerData' AS ExtractionMethod
+      FROM Sessions
+  - name: SessionHeaders
+    query: |
+      SELECT * FROM Rows(Table='composerHeaders',SQL="SELECT composerId AS ConversationId,workspaceId AS WorkspaceId,createdAt AS CreatedAtRaw,lastUpdatedAt AS LastUpdatedAtRaw,isArchived,isSubagent,subagentTypeName,value AS HeaderJSON FROM composerHeaders")
+  - name: LegacyHistory
+    query: |
+
+      LET History = SELECT SourcePath, UserProfile, SourceKey, RawJSON FROM Rows(Table='ItemTable',
+       SQL="SELECT key AS SourceKey,CAST(value AS TEXT) AS RawJSON FROM ItemTable WHERE key IN ('aiService.prompts','aiService.generations') AND json_valid(value)")
+      SELECT * FROM foreach(row=History,query={
+       SELECT SourcePath, UserProfile, SourceKey, count() AS SourceOrdinal,
+         if(condition=get(item=scope(),field='text'),then=get(item=scope(),field='text'),else=get(item=scope(),field='textDescription')) AS Content,
+         get(item=scope(),field='unixMs') AS TimestampRaw, if(condition=get(item=scope(),field='unixMs'),then=timestamp(epoch=get(item=scope(),field='unixMs'))) AS Timestamp,
+         get(item=scope(),field='generationUUID') AS RequestId, get(item=scope(),field='type') AS GenerationType, get(item=scope(),field='commandType') AS CommandType,
+         'user' AS Role, 'ItemTable/legacy' AS ExtractionMethod
+       FROM parse_json_array(data=RawJSON) })
+  - name: AgentJSON
+    query: |
+
+      LET Blobs = SELECT SourcePath, UserProfile, SourceKey, parse_json(data=RawJSON) AS B
+      FROM Rows(Table='cursorDiskKV',SQL="SELECT key AS SourceKey,CAST(value AS TEXT) AS RawJSON FROM cursorDiskKV WHERE key LIKE 'agentKv:%' AND json_valid(value)")
+      SELECT SourcePath, UserProfile, SourceKey, B.role AS Role, B.content AS Content,
+       NULL AS ConversationId, 'NOT_ESTABLISHED' AS SessionLinkStatus, 'agentKv/JSON' AS ExtractionMethod
+      FROM Blobs WHERE B.role
+  - name: UnsupportedRecords
+    query: |
+
+      SELECT * FROM Rows(Table='cursorDiskKV',SQL="SELECT key AS SourceKey,length(value) AS Bytes,CASE WHEN key LIKE 'agentKv:%' THEN 'BINARY_OR_NON_JSON_BLOB' ELSE 'INVALID_JSON' END AS Status FROM cursorDiskKV WHERE (key LIKE 'agentKv:%' OR key LIKE 'bubbleId:%' OR key LIKE 'composerData:%') AND NOT json_valid(value)")
+  - name: Transcripts
+    query: |
+
+      LET Lines(TranscriptPath) = SELECT count() AS LineNumber, Line, parse_json(data=Line) AS J
+       FROM parse_lines(filename=TranscriptPath,accessor=Accessor,buffer_size=MaxTextFileBytes)
+      SELECT * FROM foreach(row={SELECT * FROM Transcripts WHERE Size <= MaxTextFileBytes},query={
+       SELECT TranscriptPath AS SourcePath, UserProfile, LineNumber,
+         regex_replace(source=TranscriptPath.Basename,re='[.]jsonl$',replace='') AS ConversationId,
+         J.role AS Role, J.message.content AS ContentBlocks,
+         J.timestamp AS TimestampRaw, J.type AS RecordType, J.status AS Status, J.error AS Error,
+         if(condition=J,then='JSON_PARSED',else='INVALID_JSON') AS ParseStatus,
+         if(condition=NOT J,then=Line) AS UnparsedLine, 'agent-transcript/JSONL' AS ExtractionMethod
+       FROM Lines(TranscriptPath=TranscriptPath) })
+  - name: TranscriptCoverage
+    query: |
+      SELECT TranscriptPath AS SourcePath, UserProfile, Size, if(condition=Size > MaxTextFileBytes,then='SKIPPED_SIZE_LIMIT',else='PARSE_ATTEMPTED_CHECK_LOGS') AS Status FROM Transcripts

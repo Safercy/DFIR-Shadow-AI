@@ -1,0 +1,78 @@
+name: Custom.MacOS.Applications.OpenClaw.StateDir
+description: |
+  Inventaire (metadonnees seules, pas de contenu ni upload) du repertoire
+  d'etat OpenClaw ~/.openclaw (ou ~/.openclaw-<profil>) et, si present, du
+  repertoire du SDK Pi natif ~/.pi/agent/sessions. Sert de cartographie avant
+  d'utiliser les artefacts cibles (Config, Sessions, Auth, Memory, StateDB,
+  Logs, Collection).
+
+  Observe sur la cible de validation (2026-09-10, profil utilisateur de test,
+  OpenClaw v2026.6.9) :
+  ~/.openclaw contient agents/, completions/, credentials/, devices/, identity/,
+  locks/, logs/ (dont logs/stability/*.json), npm/ (projets de skills avec
+  node_modules, tres volumineux : 6063/6182 fichiers du sous-arbre lors du
+  test), openclaw.json (+ .bak/.bak.N/.last-good), plugin-skills/, service-env/,
+  state/ (openclaw.sqlite + -wal/-shm), tmp/, tui/, update-check.json,
+  workspace/ (fichiers Markdown + .git) et workspace-attestations/.
+  ~/.pi n'a pas ete observe sur cette machine (CLI `pi` natif non utilise) :
+  absence documentee, pas une preuve d'absence generale.
+
+  Par defaut le sous-arbre npm/** est exclu (bruit de dependances npm, faible
+  valeur forensique, tres volumineux) ; ajuster Include_Npm=Y si necessaire.
+  MaxResults protege contre une explosion de resultats si Include_Npm=Y sur un
+  profil avec beaucoup de skills installes.
+
+type: CLIENT
+
+author: Safercy DFIR (recherche Velociraptor OpenClaw)
+
+precondition: SELECT OS FROM info() WHERE OS = 'darwin'
+
+parameters:
+  - name: ProfileGlob
+    default: /Users/*
+  - name: StateDirNameGlob
+    default: ".openclaw*"
+    description: Nom du repertoire d'etat sous le profil (couvre les profils nommes ~/.openclaw-<name>).
+  - name: Include_Npm
+    type: bool
+    default: N
+    description: Inclure le sous-arbre npm/ (projets de skills, node_modules). Volumineux.
+  - name: Include_Pi
+    type: bool
+    default: Y
+    description: Inclure ~/.pi/agent/sessions (SDK Pi natif, si utilise en dehors d'OpenClaw).
+  - name: MaxResults
+    type: int64
+    default: 20000
+  - name: MoreRecentThan
+    type: timestamp
+    default: ""
+
+export: |
+  LET Profiles = SELECT OSPath AS HomeDir FROM glob(globs=ProfileGlob) WHERE IsDir
+
+sources:
+  - name: StateDir
+    query: |
+      LET Raw = SELECT * FROM foreach(row=Profiles, query={
+        SELECT HomeDir.Path AS UserProfile, OSPath, Mode.String AS Mode, Size,
+               Mtime, Ctime, Btime, Atime, IsDir
+        FROM glob(globs=HomeDir.Path + '/' + StateDirNameGlob + '/**', accessor='file', nosymlink=TRUE)
+        WHERE Include_Npm OR NOT OSPath =~ '/\\.openclaw[^/]*/npm/'
+      })
+
+      LET Filtered = SELECT * FROM if(condition=MoreRecentThan,
+        then={ SELECT * FROM Raw WHERE Mtime > MoreRecentThan },
+        else={ SELECT * FROM Raw })
+
+      SELECT * FROM Filtered WHERE count() <= MaxResults
+
+  - name: PiSdkSessions
+    query: |
+      SELECT * FROM if(condition=Include_Pi, then={
+        SELECT * FROM foreach(row=Profiles, query={
+          SELECT HomeDir.Path AS UserProfile, OSPath, Size, Mtime, Ctime, Btime
+          FROM glob(globs=HomeDir.Path + '/.pi/agent/sessions/**', accessor='file')
+        })
+      }) WHERE count() <= MaxResults

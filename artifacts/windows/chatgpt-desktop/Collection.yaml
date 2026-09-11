@@ -1,0 +1,51 @@
+name: Custom.Windows.Applications.ChatGPTDesktop.Collection
+description: |
+  Read-only raw NTFS acquisition to Velociraptor lab server. Includes LevelDB logs and SQLite sidecars. Live files are not an atomic snapshot. Missing matches are explicit. No decryption.
+type: CLIENT
+precondition: |
+  SELECT OS FROM info() WHERE OS = 'windows'
+parameters:
+  - name: RootGlob
+    default: C:/Users/*/AppData/Local/Packages/{OpenAI.ChatGPT-Desktop,OpenAI.Codex}_*/LocalCache/Roaming/{ChatGPT,Codex/web/Codex}
+  - name: Accessor
+    default: ntfs
+  - name: IncludeCaches
+    type: bool
+    default: false
+  - name: SupplementalGlobs
+    default: C:/__velociraptor_no_supplement_match__
+    description: |
+      Optional explicit additional application files (sessions, SQLite sidecars, plugin manifests).
+sources:
+  - name: Roots
+    query: |
+      SELECT OSPath, IsDir, Size, Mtime, Ctime, Btime FROM glob(globs=RootGlob, accessor=Accessor)
+  - name: Files
+    query: |
+      LET files <= SELECT OSPath, Size, Mtime, Ctime, Btime, Atime FROM glob(globs=RootGlob + '/**', accessor=Accessor) WHERE NOT IsDir
+      LET patterns <= SELECT * FROM foreach(row=[
+      dict(Category='IndexedDB', Pattern="(?i)[\\\\/]IndexedDB[\\\\/]"),
+      dict(Category='LocalStorage', Pattern="(?i)[\\\\/]Local Storage[\\\\/]"),
+      dict(Category='SessionStorage', Pattern="(?i)[\\\\/]Session Storage[\\\\/]"),
+      dict(Category='LocalState', Pattern="(?i)[\\\\/]Local State$"),
+      dict(Category='Cookies', Pattern="(?i)[\\\\/]Cookies[^\\\\/]*$"),
+      dict(Category='Preferences', Pattern="(?i)[\\\\/](?:Secure )?Preferences$"),
+      dict(Category='Logs', Pattern="(?i)[\\\\/]logs[\\\\/]"),
+      dict(Category='Cache', Pattern="(?i)[\\\\/]Cache[\\\\/]"),
+      dict(Category='CodeCache', Pattern="(?i)[\\\\/]Code Cache[\\\\/]"),
+      dict(Category='GPUCache', Pattern="(?i)[\\\\/]GPUCache[\\\\/]")
+      ]) WHERE IncludeCaches OR NOT Category IN ('Cache', 'CodeCache', 'GPUCache')
+      LET targets <= SELECT Category, Pattern,
+        { SELECT * FROM files WHERE OSPath =~ Pattern } AS Matches
+      FROM patterns
+      SELECT * FROM foreach(row=targets, query={
+        SELECT * FROM if(condition=len(list=Matches), then={
+          SELECT Category, RootGlob, Pattern, 'Matched' AS Status, OSPath, Size, Mtime, Ctime, Btime, Atime,
+            upload(file=OSPath, accessor=Accessor) AS Upload FROM foreach(row=Matches)
+        }, else={
+          SELECT Category, RootGlob, Pattern, 'NoMatch' AS Status FROM scope()
+        })
+      })
+  - name: Supplemental
+    query: |
+      SELECT OSPath, Size, Mtime, Ctime, Btime, upload(file=OSPath, accessor='ntfs') AS Upload FROM glob(globs=SupplementalGlobs, accessor='ntfs') WHERE NOT IsDir

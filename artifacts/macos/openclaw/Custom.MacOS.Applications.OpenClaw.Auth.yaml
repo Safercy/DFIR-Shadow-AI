@@ -1,0 +1,91 @@
+name: Custom.MacOS.Applications.OpenClaw.Auth
+description: |
+  Inspecte la base SQLite d'authentification par agent
+  ~/.openclaw/agents/<agentId>/agent/openclaw-agent.sqlite (WAL/SHM
+  potentiellement presents : le plugin sqlite() de Velociraptor lit le
+  fichier tel quel, sans forcer de checkpoint WAL prealable).
+
+  Schema CONFIRME sur la cible de validation (2026-09-10, agent "main", sqlite_master reel) :
+  tables schema_meta, cache_entries, auth_profile_store (cle primaire
+  store_key, colonne store_json), auth_profile_state (state_key, state_json),
+  memory_index_meta/sources/chunks/... (cf. artefact Memory dedie).
+  auth_profile_store contenait un seul profil ("primary") sur cette machine.
+
+  Par defaut cet artefact NE RENVOIE PAS le contenu de store_json/state_json
+  (qui porte les jetons OAuth/API en clair) : seules les cles et dates de
+  mise a jour sont exposees, pour permettre un hunt large sans exfiltrer de
+  secrets. Mettre Unsafe_DumpValues=Y uniquement pour une investigation
+  ciblee et autorisee sur un client precis.
+
+  Limite connue : le nom exact du repertoire agent (ici "main") n'est pas
+  fixe par le produit (cle libre choisie a la creation de l'agent) ; le
+  glob agents/*/agent/*.sqlite le decouvre sans le coder en dur.
+
+type: CLIENT
+
+author: Safercy DFIR (recherche Velociraptor OpenClaw)
+
+precondition: SELECT OS FROM info() WHERE OS = 'darwin'
+
+parameters:
+  - name: ProfileGlob
+    default: /Users/*
+  - name: StateDirNameGlob
+    default: ".openclaw*"
+  - name: Unsafe_DumpValues
+    type: bool
+    default: N
+    description: |
+      DANGER : si Y, renvoie store_json/state_json en clair (jetons
+      OAuth/API, secrets d'authentification des canaux). Reserver a une
+      investigation autorisee et a une diffusion restreinte des resultats.
+
+export: |
+  LET Profiles = SELECT OSPath AS HomeDir FROM glob(globs=ProfileGlob) WHERE IsDir
+
+  LET AgentDbs = SELECT * FROM foreach(row=Profiles, query={
+    SELECT HomeDir.Path AS UserProfile, OSPath, path_split(path=OSPath)[-3] AS AgentId
+    FROM glob(globs=HomeDir.Path + '/' + StateDirNameGlob + '/agents/*/agent/*.sqlite', accessor='file')
+  })
+
+sources:
+  - name: SchemaMeta
+    query: |
+      SELECT * FROM foreach(row=AgentDbs, query={
+        SELECT UserProfile, AgentId, OSPath AS SourcePath,
+               meta_key AS MetaKey, role AS Role, schema_version AS SchemaVersion,
+               agent_id AS AgentIdInDb, app_version AS AppVersion,
+               timestamp(epoch=created_at / 1000) AS CreatedAt,
+               timestamp(epoch=updated_at / 1000) AS UpdatedAt
+        FROM sqlite(file=OSPath, query='SELECT * FROM schema_meta')
+      })
+
+  - name: AuthProfiles
+    query: |
+      SELECT * FROM foreach(row=AgentDbs, query={
+        SELECT UserProfile, AgentId, OSPath AS SourcePath,
+               store_key AS StoreKey, timestamp(epoch=updated_at / 1000) AS UpdatedAt,
+               len(list=store_json) AS StoreJsonLength,
+               if(condition=Unsafe_DumpValues, then=store_json) AS StoreJsonUnsafe
+        FROM sqlite(file=OSPath, query='SELECT store_key, store_json, updated_at FROM auth_profile_store')
+      })
+
+  - name: AuthProfileState
+    query: |
+      SELECT * FROM foreach(row=AgentDbs, query={
+        SELECT UserProfile, AgentId, OSPath AS SourcePath,
+               state_key AS StateKey, timestamp(epoch=updated_at / 1000) AS UpdatedAt,
+               len(list=state_json) AS StateJsonLength,
+               if(condition=Unsafe_DumpValues, then=state_json) AS StateJsonUnsafe
+        FROM sqlite(file=OSPath, query='SELECT state_key, state_json, updated_at FROM auth_profile_state')
+      })
+
+  - name: CacheEntriesSummary
+    query: |
+      SELECT * FROM foreach(row=AgentDbs, query={
+        SELECT UserProfile, AgentId, OSPath AS SourcePath,
+               scope AS Scope, count() AS EntryCount,
+               timestamp(epoch=max(item=updated_at) / 1000) AS LastUpdated
+        FROM sqlite(file=OSPath, query='SELECT scope, updated_at FROM cache_entries')
+        GROUP BY Scope
+      })

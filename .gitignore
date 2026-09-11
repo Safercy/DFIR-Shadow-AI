@@ -1,0 +1,28 @@
+# Local configuration and credentials
+.env
+.env.*
+client_api_config*.yaml
+*.pem
+*.key
+# Evidence, runtime and local analysis
+evidence/
+analysis/
+validation/
+extracted/
+results/
+working/
+*.jsonl
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+*.zip
+*.exe
+*.dll
+*.pyd
+venv/
+.venv/
+node_modules/
+__pycache__/
+*.pyc
+.DS_Store

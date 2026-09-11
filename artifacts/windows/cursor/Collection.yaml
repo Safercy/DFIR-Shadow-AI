@@ -1,0 +1,54 @@
+name: Custom.Windows.Applications.Cursor.Collection
+description: |
+  Collect Cursor SQLite databases with sidecars, transcripts, agent tools,
+  terminals, code tracking, checkpoints, local history, snapshots and logs.
+  Live copies are not atomic snapshots. Cursor is not stopped or modified.
+  Upload results include hashes and errors. Check logs and validate SQLite copies.
+  Depth is bounded by **12; oversized files are reported as skipped.
+  Set collection-wide upload, row and time limits in Velociraptor.
+  Raw databases/logs may contain secrets even with IncludeConfiguration disabled.
+type: CLIENT
+precondition: |
+  SELECT OS FROM info() WHERE OS = 'windows'
+parameters:
+  - name: AdditionalProfileGlobs
+    default: C:/Users/*
+  - name: AdditionalGlobs
+    default: ""
+    description: |
+      Newline-separated paths/globs for custom roots or workspace rules.
+  - name: IncludeCaches
+    default: N
+    type: bool
+  - name: IncludeConfiguration
+    default: N
+    type: bool
+  - name: MaxFileBytes
+    default: 268435456
+    type: int
+sources:
+  - name: Files
+    query: |
+      LET Profiles = SELECT UserProfile FROM chain(
+        a={ SELECT expand(path=Directory) AS UserProfile FROM Artifact.Windows.Sys.Users() },
+        b={ SELECT OSPath AS UserProfile FROM glob(globs=AdditionalProfileGlobs) WHERE IsDir })
+        GROUP BY UserProfile
+      LET Patterns = SELECT Pattern FROM chain(
+        a={ SELECT UserProfile + '/AppData/Roaming/Cursor/User/{globalStorage,workspaceStorage,History}/**12' AS Pattern FROM Profiles },
+        b={ SELECT UserProfile + '/AppData/Roaming/Cursor/{logs,snapshots,Backups}/**12' AS Pattern FROM Profiles },
+        c={ SELECT UserProfile + '/.cursor/{projects,ai-tracking,chats,plans}/**12' AS Pattern FROM Profiles },
+        d={ SELECT UserProfile + '/.cursor/prompt_history.json' AS Pattern FROM Profiles },
+        e={ SELECT UserProfile + '/AppData/Local/Programs/cursor/resources/app/{package,product}.json' AS Pattern FROM Profiles },
+        f={ SELECT _value AS Pattern FROM foreach(row=split(string=AdditionalGlobs, sep='\n')) WHERE _value },
+        g={ SELECT UserProfile + '/AppData/Roaming/Cursor/{Cache,Local Storage,Session Storage,IndexedDB,Network}/**12' AS Pattern FROM Profiles WHERE IncludeCaches },
+        h={ SELECT UserProfile + '/.cursor/{*.json,skills/**12,skills-cursor/**12,extensions/extensions.json}' AS Pattern FROM Profiles WHERE IncludeConfiguration },
+        i={ SELECT UserProfile + '/AppData/Roaming/Cursor/User/{settings.json,keybindings.json,snippets/**12}' AS Pattern FROM Profiles WHERE IncludeConfiguration },
+        j={ SELECT UserProfile + '/AppData/Roaming/Cursor/{Local State,Preferences,machineid}' AS Pattern FROM Profiles WHERE IncludeConfiguration })
+      LET Files = SELECT OSPath, Size, Mtime, Ctime, Btime FROM glob(globs=Patterns.Pattern, accessor='ntfs')
+        WHERE NOT IsDir GROUP BY OSPath
+      SELECT OSPath AS SourcePath, Size, Mtime, Ctime, Btime,
+        now() AS CollectionTime,
+        if(condition=Size <= MaxFileBytes, then='ATTEMPTED', else='SKIPPED_SIZE_LIMIT') AS CollectionStatus,
+        if(condition=Size <= MaxFileBytes,
+          then=upload(file=OSPath, accessor='ntfs')) AS Upload
+      FROM Files

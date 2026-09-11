@@ -1,0 +1,83 @@
+name: Custom.Windows.Applications.Cursor.ContextExtraction
+type: CLIENT
+description: |
+  Extract additional Cursor evidence: code provenance, commits, tracked content,
+  workspace/recent paths, terminal history, checkpoint/diff records. Tables vary by version.
+  Empty tables are explicitly visible in Coverage but do not prove absence of past use.
+  Raw context and code may contain sensitive information.
+parameters:
+  - name: AdditionalProfileGlobs
+    default: C:/Users/*
+  - name: DatabaseGlobs
+    default: ""
+    description: |
+      Newline-separated explicit databases. When set, replaces profile-based database discovery; supports offline copies.
+  - name: Accessor
+    default: auto
+    description: |
+      Use auto for live files/offline copies. NTFS may not preserve the same live SQLite/WAL view.
+  - name: MaxDatabaseBytes
+    default: "268435456"
+    description: |
+      Oversized databases are reported in Coverage.
+    type: int
+precondition: |
+  SELECT OS FROM info() WHERE OS = 'windows' OR DatabaseGlobs
+export: |
+
+  LET Profiles = SELECT UserProfile FROM chain(
+    a={ SELECT expand(path=Directory) AS UserProfile FROM Artifact.Windows.Sys.Users() },
+    b={ SELECT OSPath AS UserProfile FROM glob(globs=AdditionalProfileGlobs) WHERE IsDir }) GROUP BY UserProfile
+  LET Databases = SELECT * FROM if(condition=DatabaseGlobs,
+    then={ SELECT OSPath AS DBPath, NULL AS UserProfile, Size FROM glob(globs=split(string=DatabaseGlobs, sep='\n'), accessor=Accessor) WHERE NOT IsDir },
+    else={ SELECT * FROM foreach(row=Profiles, query={
+      SELECT OSPath AS DBPath, UserProfile, Size FROM glob(globs=[
+        UserProfile + '/AppData/Roaming/Cursor/User/globalStorage/state.vscdb',
+        UserProfile + '/AppData/Roaming/Cursor/User/workspaceStorage/*/state.vscdb',
+        UserProfile + '/.cursor/ai-tracking/ai-code-tracking.db',
+        UserProfile + '/AppData/Roaming/Cursor/User/globalStorage/conversation-search.db',
+        UserProfile + '/AppData/Roaming/Cursor/snapshots/state/state.db'], accessor=Accessor) WHERE NOT IsDir }) })
+  LET Rows(Table, SQL) = SELECT * FROM foreach(row={SELECT * FROM Databases WHERE Size <= MaxDatabaseBytes}, query={
+    SELECT * FROM if(condition={SELECT name FROM sqlite(file=DBPath,accessor=Accessor,query="SELECT name FROM sqlite_master WHERE type='table'") WHERE name = Table},
+      then={SELECT DBPath AS SourcePath, UserProfile, * FROM sqlite(file=DBPath,accessor=Accessor,query=SQL)}) })
+sources:
+  - name: Coverage
+    query: |
+
+      LET SchemaRows = SELECT DBPath AS SourcePath, UserProfile, Size,
+        { SELECT name FROM sqlite(file=DBPath,accessor=Accessor,query="SELECT name FROM sqlite_master WHERE type='table'") } AS TableList
+        FROM Databases WHERE Size <= MaxDatabaseBytes
+      SELECT * FROM chain(
+       a={SELECT SourcePath,UserProfile,Size,TableList.name AS Tables,
+         if(condition=TableList,then='TABLES_READ',else='NO_TABLES_OR_READ_ERROR_CHECK_LOGS') AS Status FROM SchemaRows},
+       b={SELECT DBPath AS SourcePath,UserProfile,Size,'SKIPPED_SIZE_LIMIT' AS Status FROM Databases WHERE Size > MaxDatabaseBytes})
+  - name: ai_code_hashes
+    query: |
+      SELECT * FROM Rows(Table='ai_code_hashes',SQL='SELECT * FROM ai_code_hashes')
+  - name: scored_commits
+    query: |
+      SELECT * FROM Rows(Table='scored_commits',SQL='SELECT * FROM scored_commits')
+  - name: tracked_file_content
+    query: |
+      SELECT * FROM Rows(Table='tracked_file_content',SQL='SELECT * FROM tracked_file_content')
+  - name: ai_deleted_files
+    query: |
+      SELECT * FROM Rows(Table='ai_deleted_files',SQL='SELECT * FROM ai_deleted_files')
+  - name: conversation_summaries
+    query: |
+      SELECT * FROM Rows(Table='conversation_summaries',SQL='SELECT * FROM conversation_summaries')
+  - name: h_ref
+    query: |
+      SELECT * FROM Rows(Table='h_ref',SQL='SELECT * FROM h_ref')
+  - name: h_commit
+    query: |
+      SELECT * FROM Rows(Table='h_commit',SQL='SELECT * FROM h_commit')
+  - name: h_checkpoint
+    query: |
+      SELECT * FROM Rows(Table='h_checkpoint',SQL='SELECT * FROM h_checkpoint')
+  - name: WorkspaceAndHistory
+    query: |
+      SELECT * FROM Rows(Table='ItemTable',SQL="SELECT key AS SourceKey,CAST(value AS TEXT) AS RawJSON FROM ItemTable WHERE key IN ('history.recentlyOpenedPathsList','history.entries','terminal.history.entries.commands','terminal.history.entries.dirs','composer.composerData','workbench.panel.aichat.view.aichat.chatdata')")
+  - name: CheckpointsAndDiffs
+    query: |
+      SELECT * FROM Rows(Table='cursorDiskKV',SQL="SELECT key AS SourceKey,CAST(value AS TEXT) AS RawJSON FROM cursorDiskKV WHERE key LIKE 'checkpointId:%' OR key LIKE 'inlineDiff:%' OR key LIKE 'codeBlock%' OR key LIKE 'composer.content.%' OR key LIKE 'ofsContent:%'")

@@ -1,0 +1,55 @@
+name: Custom.MacOS.Applications.OpenClaw.TCC
+description: |
+  Interroge TCC.db pour les autorisations accordees a l'app native OpenClaw
+  (bundle "ai.openclaw.mac") et a son helper Peekaboo, quand ils sont
+  presents (Accessibility, Screen Recording, Microphone, Speech Recognition,
+  Automation/AppleEvents, Camera, Notifications).
+
+  LIMITE OBSERVEE ET CONFIRMEE sur la cible de validation (2026-09-10) : la lecture directe
+  de TCC.db par l'agent Velociraptor a echoue avec l'erreur
+  "operation not permitted" sur `/Library/Application Support/com.apple.TCC`
+  ET `/Users/<user>/Library/Application Support/com.apple.TCC` -- le
+  binaire agent Velociraptor lui-meme n'a pas l'autorisation Full Disk
+  Access (kTCCServiceSystemPolicyAllFiles), ce qui bloque tccutil/sqlite au
+  niveau du systeme d'exploitation, independamment des droits VQL. C'est un
+  REFUS AU NIVEAU macOS, pas une absence d'artefact. Cette source ne
+  produira donc aucune ligne tant que le processus agent Velociraptor
+  (`velociraptor` / le binaire qui l'a lance) n'a pas explicitement recu
+  Full Disk Access dans Reglages Systeme > Confidentialite et securite, ou
+  n'est pas execute par un compte/outil qui l'a deja (ex. certains agents
+  MDM). A defaut, une collecte manuelle de TCC.db via une image disque ou un
+  export hors ligne reste necessaire pour ce point precis.
+
+  Sur cette machine, l'app native /Applications/OpenClaw.app etait de toute
+  facon absente (installation CLI + LaunchAgent uniquement) : aucune entree
+  "ai.openclaw.mac" n'etait donc attendue meme en cas d'acces reussi.
+
+type: CLIENT
+
+author: Safercy DFIR (recherche Velociraptor OpenClaw)
+
+precondition: SELECT OS FROM info() WHERE OS = 'darwin'
+
+parameters:
+  - name: TCCGlob
+    default: "/Library/Application Support/com.apple.TCC/TCC.db,/Users/*/Library/Application Support/com.apple.TCC/TCC.db"
+  - name: BundleRegex
+    type: regex
+    default: "(?i)openclaw|peekaboo|clawdbot|moltbot"
+
+sources:
+  - name: OpenClawTccEntries
+    query: |
+      LET TCCList = SELECT OSPath FROM glob(globs=split(string=TCCGlob, sep=','))
+
+      LET Access = SELECT * FROM foreach(row=TCCList, query={
+        SELECT OSPath AS SourcePath,
+               timestamp(epoch=last_modified) AS LastModified,
+               service AS Service, client AS Client,
+               if(condition=client_type = 0, then='Console', else=if(condition=client_type = 1, then='Service/Script', else='Other')) AS ClientType,
+               if(condition=auth_value = 2, then='Yes', else='No') AS Allowed,
+               if(condition=OSPath =~ 'Users', then=path_split(path=OSPath)[-5], else='System') AS User
+        FROM sqlite(file=OSPath, query='SELECT * FROM access')
+      })
+
+      SELECT * FROM Access WHERE Client =~ BundleRegex

@@ -1,0 +1,75 @@
+name: Custom.MacOS.Applications.OpenClaw.Memory
+description: |
+  Inspecte la memoire vectorielle/indexee d'OpenClaw. CORRECTIF par rapport
+  a l'hypothese initiale du dossier de recherche : sur la cible de validation (2026-09-10,
+  OpenClaw v2026.6.9), il N'Y A PAS de fichier dedie
+  ~/.openclaw/memory/<agent_id>.sqlite utilisant l'extension sqlite-vec.
+  La memoire est stockee DANS la meme base que l'authentification,
+  ~/.openclaw/agents/<agentId>/agent/openclaw-agent.sqlite, dans des tables
+  memory_index_meta, memory_index_sources (path/source/hash/mtime/size),
+  memory_index_chunks (id/path/source/start_line/end_line/hash/model/text/
+  embedding TEXT/updated_at), memory_embedding_cache (provider/model/
+  provider_key/hash/embedding/dims), memory_index_state (revision, maj par
+  triggers SQL), et un index plein texte FTS5 memory_index_chunks_fts. Les
+  embeddings sont stockes en TEXT (tres probablement du JSON serialise), pas
+  via l'extension binaire sqlite-vec. Sur la machine testee, ces tables
+  existent mais sont VIDES (0 ligne) : la fonctionnalite memoire n'a pas ete
+  utilisee (aucun fichier workspace/memory/*.md non plus). Schema confirme
+  via sqlite_master ; contenu observe = absent, pas refute pour d'autres
+  installations.
+
+  Par defaut le texte des chunks (Include_ChunkText=N) et les vecteurs
+  d'embedding ne sont pas renvoyes (volume + contenu potentiellement issu de
+  conversations/documents personnels) ; seules les metadonnees (chemins,
+  hash, plages de lignes, dates) le sont.
+
+type: CLIENT
+
+author: Safercy DFIR (recherche Velociraptor OpenClaw)
+
+precondition: SELECT OS FROM info() WHERE OS = 'darwin'
+
+parameters:
+  - name: ProfileGlob
+    default: /Users/*
+  - name: StateDirNameGlob
+    default: ".openclaw*"
+  - name: Include_ChunkText
+    type: bool
+    default: N
+
+export: |
+  LET Profiles = SELECT OSPath AS HomeDir FROM glob(globs=ProfileGlob) WHERE IsDir
+
+  LET AgentDbs = SELECT * FROM foreach(row=Profiles, query={
+    SELECT HomeDir.Path AS UserProfile, OSPath, path_split(path=OSPath)[-3] AS AgentId
+    FROM glob(globs=HomeDir.Path + '/' + StateDirNameGlob + '/agents/*/agent/*.sqlite', accessor='file')
+  })
+
+sources:
+  - name: IndexSources
+    query: |
+      SELECT * FROM foreach(row=AgentDbs, query={
+        SELECT UserProfile, AgentId, OSPath AS SourcePath,
+               path AS IndexedPath, source AS Source, hash AS Hash,
+               timestamp(epoch=mtime / 1000) AS SourceMtime, size AS SourceSize
+        FROM sqlite(file=OSPath, query='SELECT path, source, hash, mtime, size FROM memory_index_sources')
+      })
+
+  - name: Chunks
+    query: |
+      SELECT * FROM foreach(row=AgentDbs, query={
+        SELECT UserProfile, AgentId, OSPath AS SourcePath,
+               id AS ChunkId, path AS ChunkPath, source AS Source,
+               start_line AS StartLine, end_line AS EndLine, hash AS Hash,
+               model AS EmbeddingModel, timestamp(epoch=updated_at / 1000) AS UpdatedAt,
+               if(condition=Include_ChunkText, then=text) AS TextUnsafe
+        FROM sqlite(file=OSPath, query='SELECT id, path, source, start_line, end_line, hash, model, text, updated_at FROM memory_index_chunks')
+      })
+
+  - name: IndexState
+    query: |
+      SELECT * FROM foreach(row=AgentDbs, query={
+        SELECT UserProfile, AgentId, OSPath AS SourcePath, revision AS Revision
+        FROM sqlite(file=OSPath, query='SELECT revision FROM memory_index_state')
+      })

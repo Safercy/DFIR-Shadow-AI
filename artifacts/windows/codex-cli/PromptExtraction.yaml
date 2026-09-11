@@ -1,0 +1,90 @@
+name: Custom.Windows.Applications.CodexCLI.PromptExtraction
+description: |
+  Read-only, no-upload triage: parses Codex CLI/desktop artifacts directly in VQL on the endpoint and returns human-readable prompts, agent activity and thread metadata as query results, instead of raw files to parse offline. Six sources, cross-checkable: (1) ThreadsSummary from state_*.sqlite (threads table) — one row per thread with title, first_user_message, model, cwd, tokens_used, sandbox_policy (allowed read/write paths for that session) and approval_mode, no JSON parsing needed; (2) ThreadItems from thread_history_*.sqlite (thread_items table) — every item with message text extracted where present, full activity timeline; (3) ActivityLog — same table filtered to commandExecution/fileChange/mcpToolCall/webSearch, with verified per-type extraction (shell command + stdout/exit code, changed file paths + written content, search queries + result domains) plus the fully parsed item as a fallback column for anything not specifically projected; (4) TokenUsage from rollout jsonl (token_usage_record events) — per-call and per-thread token counts; (5) ExternalAgentConfigImports from state_*.sqlite (table of the same name; schema not fixed here, SELECT * passthrough); (6) RolloutPrompts from sessions/**/rollout-*.jsonl (event_msg/item_completed events) as a fallback/cross-check when the SQLite index lags or is corrupt. ContentPartCount > 1 on an item is a signal of a multi-part message (possible attachment/non-text content) worth pulling the raw file for. No files are uploaded; only derived text/metadata. Schemas for ThreadsSummary/ThreadItems/webSearch/commandExecution/fileChange/token_usage_record were verified by hand against a real Codex session (2026-09-05 investigation); ExternalAgentConfigImports and mcpToolCall-specific fields were not (table was empty / fields not confirmed on the test host) — RawItem is kept for those so nothing is lost even if a projected column comes back null. This artifact has not yet been run live via collect_client — validate output shape on first use. SQLite files are read live via the given accessor: WAL-only (uncommitted) rows are not guaranteed to be visible, and this is not an atomic snapshot.
+type: CLIENT
+precondition: |
+  SELECT OS FROM info() WHERE OS = 'windows'
+parameters:
+  - name: RootGlob
+    default: C:/Users/*/.codex
+  - name: Accessor
+    default: ntfs
+sources:
+  - name: ThreadsSummary
+    query: |
+      LET dbs <= SELECT OSPath FROM glob(globs=RootGlob + '/state_*.sqlite', accessor=Accessor)
+      SELECT * FROM foreach(row=dbs, query={
+        SELECT OSPath AS SourceFile, id AS ThreadId, name AS ThreadName, title AS Title, preview AS Preview,
+          first_user_message AS FirstUserMessage, model AS Model, reasoning_effort AS ReasoningEffort,
+          cli_version AS CliVersion, source AS Source, cwd AS Cwd, tokens_used AS TokensUsed,
+          sandbox_policy AS SandboxPolicy, approval_mode AS ApprovalMode,
+          git_origin_url AS GitOriginUrl, git_branch AS GitBranch,
+          timestamp(epoch=created_at_ms / 1000) AS CreatedAt, timestamp(epoch=updated_at_ms / 1000) AS UpdatedAt
+        FROM sqlite(file=OSPath, accessor=Accessor, query="SELECT id, name, title, preview, first_user_message, model, reasoning_effort, cli_version, source, cwd, tokens_used, sandbox_policy, approval_mode, git_origin_url, git_branch, created_at_ms, updated_at_ms FROM threads")
+      })
+  - name: ThreadItems
+    query: |
+      LET dbs <= SELECT OSPath FROM glob(globs=RootGlob + '/thread_history_*.sqlite', accessor=Accessor)
+      LET raw = SELECT OSPath AS SourceFile, thread_id AS ThreadId, turn_id AS TurnId, item_id AS ItemId,
+            item_type AS ItemType, timestamp(epoch=created_at_ms / 1000) AS Timestamp, item_json AS ItemJson,
+            parse_json(data=item_json) AS Item
+          FROM sqlite(file=OSPath, accessor=Accessor, query="SELECT thread_id, turn_id, item_id, item_type, created_at_ms, item_json FROM thread_items ORDER BY rollout_ordinal")
+      SELECT * FROM foreach(row=dbs, query={
+        SELECT SourceFile, ThreadId, TurnId, ItemId, ItemType, Timestamp,
+          Item.content[0].text AS Text,
+          len(list=Item.content) AS ContentPartCount,
+          ItemJson
+        FROM raw
+      })
+  - name: ActivityLog
+    query: |
+      LET dbs <= SELECT OSPath FROM glob(globs=RootGlob + '/thread_history_*.sqlite', accessor=Accessor)
+      LET raw = SELECT OSPath AS SourceFile, thread_id AS ThreadId, turn_id AS TurnId, item_id AS ItemId,
+            item_type AS ItemType, timestamp(epoch=created_at_ms / 1000) AS Timestamp,
+            parse_json(data=item_json) AS Item
+          FROM sqlite(file=OSPath, accessor=Accessor, query="SELECT thread_id, turn_id, item_id, item_type, created_at_ms, item_json FROM thread_items WHERE item_type IN ('commandExecution','fileChange','mcpToolCall','webSearch') ORDER BY rollout_ordinal")
+      SELECT * FROM foreach(row=dbs, query={
+        SELECT SourceFile, ThreadId, TurnId, ItemId, ItemType, Timestamp,
+          join(array=Item.command, sep=' ') AS Command,
+          Item.cwd AS Cwd,
+          Item.exit_code AS ExitCode,
+          Item.aggregated_output AS CommandOutput,
+          Item.changes AS FileChanges,
+          Item.query AS SearchQuery,
+          Item.action.queries AS SearchQueries,
+          len(list=Item.results) AS SearchResultCount,
+          join(array=Item.results.domain, sep=', ') AS SearchResultDomains,
+          Item AS RawItem
+        FROM raw
+      })
+  - name: TokenUsage
+    query: |
+      LET files <= SELECT OSPath FROM glob(globs=RootGlob + '/sessions/**/rollout-*.jsonl', accessor=Accessor)
+      LET events = SELECT OSPath AS SourceFile, parse_json(data=Line) AS Parsed FROM parse_lines(filename=OSPath, accessor=Accessor)
+      SELECT * FROM foreach(row=files, query={
+        SELECT SourceFile, Parsed.timestamp AS Timestamp, Parsed.payload.thread_id AS ThreadId, Parsed.payload.turn_id AS TurnId,
+          Parsed.payload.usage.input_tokens AS InputTokens, Parsed.payload.usage.cached_input_tokens AS CachedInputTokens,
+          Parsed.payload.usage.output_tokens AS OutputTokens, Parsed.payload.usage.reasoning_output_tokens AS ReasoningOutputTokens,
+          Parsed.payload.usage.total_tokens AS TotalTokens,
+          Parsed.payload.thread_token_usage.total_tokens AS ThreadTotalTokens
+        FROM events
+        WHERE Parsed.type = 'token_usage_record'
+      })
+  - name: ExternalAgentConfigImports
+    query: |
+      LET dbs <= SELECT OSPath FROM glob(globs=RootGlob + '/state_*.sqlite', accessor=Accessor)
+      SELECT * FROM foreach(row=dbs, query={
+        SELECT OSPath AS SourceFile, * FROM sqlite(file=OSPath, accessor=Accessor, query="SELECT * FROM external_agent_config_imports")
+      })
+  - name: RolloutPrompts
+    query: |
+      LET files <= SELECT OSPath FROM glob(globs=RootGlob + '/sessions/**/rollout-*.jsonl', accessor=Accessor)
+      LET events = SELECT OSPath AS SourceFile, parse_json(data=Line) AS Parsed FROM parse_lines(filename=OSPath, accessor=Accessor)
+      SELECT * FROM foreach(row=files, query={
+        SELECT SourceFile, Parsed.timestamp AS Timestamp, Parsed.payload.thread_id AS ThreadId,
+          Parsed.payload.turn_id AS TurnId, Parsed.payload.item.type AS ItemType,
+          Parsed.payload.item.content[0].text AS Text,
+          len(list=Parsed.payload.item.content) AS ContentPartCount
+        FROM events
+        WHERE Parsed.type = 'event_msg' AND Parsed.payload.type = 'item_completed' AND Parsed.payload.item.type =~ '(?i)^(usermessage|agentmessage)$'
+      })

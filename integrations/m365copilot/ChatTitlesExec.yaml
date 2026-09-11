@@ -1,0 +1,102 @@
+name: Custom.Windows.Applications.M365Copilot.ChatTitlesExec
+description: |
+  Extracts cached GetChats conversation titles on the Windows endpoint using an external portable Python bundle. Stages the HTTP cache through ntfs into temporary copies before execve. Titles are metadata, not guaranteed verbatim prompts or complete conversations. Configure the tool URL and expected SHA-256 before deployment; see README.md in this directory. The source cache is not opened for writing. Live copies are not atomic; temporary files are removed at collection end.
+required_permissions:
+  - EXECVE
+  - FILESYSTEM_WRITE
+tools:
+  - name: M365ChatTitlesPy
+    url: https://example.invalid/M365ChatTitlesPy.zip
+    serve_locally: true
+type: CLIENT
+precondition: |
+  SELECT OS FROM info() WHERE OS = 'windows'
+parameters:
+  - name: ProfileGlob
+    default: C:/Users/*
+  - name: KeyRegex
+    default: m365Copilot/GetChats
+  - name: regex
+    type: regex
+    default: ""
+    description: |
+      Optional filter on ChatName only. Empty keeps everything the tool finds.
+export: |
+  LET Payload <= SELECT * FROM Artifact.Generic.Utils.FetchBinary(
+    ToolName="M365ChatTitlesPy", IsExecutable='N')
+
+  LET ExtractDir <= tempdir(remove_last=TRUE)
+
+  -- type='zip' forced explicitly: the cached tool file on the endpoint is
+  -- named after its content hash (no .zip extension), so unzip()'s default
+  -- extension-based autodetection fails with "unknown file type".
+  LET Unzipped <= SELECT NewPath FROM unzip(
+    filename=Payload.OSPath[0], output_directory=ExtractDir, type='zip')
+
+  LET PythonExe <= ExtractDir + '/python.exe'
+  LET ScriptPath <= ExtractDir + '/extract_chat_titles_live.py'
+
+  -- Each Cache_Data directory gets its own per-row staging tempdir,
+  -- computed once as a column here (same idiom as DiskPromptQueries.yaml's
+  -- `tempdir(remove_last=TRUE) AS WorkingDir`), so both the staging step
+  -- and the execve step below can reference the same StagedDir per row.
+  LET CacheDirs <= SELECT OSPath AS CacheDir,
+      tempdir(remove_last=TRUE) AS StagedDir
+    FROM glob(
+      globs=ProfileGlob + '/AppData/Local/Packages/Microsoft.MicrosoftOfficeHub_*/LocalState/EBWebView/*/Cache/Cache_Data',
+      accessor='ntfs') WHERE IsDir
+
+  -- Stage a copy of each Cache_Data with the `ntfs` accessor (raw disk
+  -- read) before handing it to the tool: Chromium's block files
+  -- (data_0..data_3, index) are held open with a share mode that denies
+  -- a plain Win32 copy (verified: shutil.copytree got Errno 13 on exactly
+  -- those files, not on the individual f_* entries). `foreach(query={...})`
+  -- only accepts a single SELECT, so `copy()` runs as a column expression
+  -- inside the WHERE-matched rows, same idiom as DiskPromptQueries.yaml's
+  -- own `LET Copies <=`. This eager LET forces every copy to run before
+  -- `Runs` (execve) below is evaluated.
+  LET Copies <= SELECT * FROM foreach(row=CacheDirs, query={
+      SELECT OSPath, StagedDir,
+        copy(filename=OSPath, accessor='ntfs',
+             dest=StagedDir + '/' + basename(path=OSPath)) AS Dest
+      FROM glob(globs=CacheDir + '/*', accessor='ntfs')
+      WHERE NOT IsDir
+    })
+
+  -- execve() is a FROM-clause plugin, not a column function: it must drive
+  -- the FROM of its own (sub)query. (Verified: `SELECT execve(...) AS x
+  -- FROM ...` fails to compile with "Unknown function execve()"; `SELECT *
+  -- FROM execve(...)` does not.)
+  LET Runs = SELECT * FROM foreach(row=CacheDirs, query={
+      SELECT CacheDir, StagedDir, ReturnCode, Stdout, Stderr FROM execve(
+        argv=[PythonExe, ScriptPath, '--cache-dir', StagedDir,
+              '--key-regex', KeyRegex, '--regex', regex],
+        length=10000000)
+    })
+
+  LET Parsed <= SELECT CacheDir, ReturnCode, Stderr,
+      parse_json(data=Stdout) AS Result
+    FROM Runs
+sources:
+  - name: ConversationTitles
+    query: |
+      -- The nested foreach()'s query={} binds each ConversationTitles[i]
+      -- item's own fields directly into scope (ConversationId, ChatName,
+      -- ...) -- referencing `Result.X` here (as in earlier revisions) re-
+      -- reads the outer per-CacheDir Result object, which has no such
+      -- top-level fields, producing all-null rows despite a correct row
+      -- count.
+      SELECT * FROM foreach(row=Parsed, query={
+        SELECT CacheDir, ReturnCode,
+          ConversationId, ChatName, CreateTimeUtc, CreateTimeUtcRaw,
+          UpdateTimeUtc, UpdateTimeUtcRaw, ThreadId, EvidenceType,
+          ExtractionMethod, CacheRequestKey, CacheRequestTimeRaw,
+          CacheFileHash
+        FROM foreach(row=Result.ConversationTitles)
+      })
+  - name: Diagnostics
+    query: |
+      SELECT CacheDir, ReturnCode, Stderr,
+        Result.Diagnostics AS Diagnostics,
+        Result.Errors AS Errors
+      FROM Parsed

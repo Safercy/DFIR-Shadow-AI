@@ -1,0 +1,126 @@
+name: Custom.MacOS.Applications.OpenClaw.Config
+description: |
+  Collecte et parse la configuration OpenClaw : openclaw.json (JSON5, ecrit de
+  facon atomique via rename), ses sauvegardes openclaw.json.bak / .bak.N /
+  .last-good, et le journal d'ecriture logs/config-audit.jsonl (evenements
+  config.write avec hash avant/apres, pid/ppid/argv du process ecrivain,
+  utile pour une chronologie point-in-time).
+
+  Observe sur la cible de validation (2026-09-10, profil de test, OpenClaw v2026.6.9) : openclaw.json
+  contient notamment agents.defaults.model.primary, gateway.mode/port/bind,
+  gateway.auth.{mode,token} (jeton en clair du Control UI/gateway local),
+  auth.profiles.<id>.{provider,mode} (ex. anthropic:claude-cli en mode oauth,
+  secret reel stocke a part dans agents/<id>/agent/openclaw-agent.sqlite, cf.
+  Custom.MacOS.Applications.OpenClaw.Auth), channels.slack.{botToken,appToken}
+  sous forme de REFERENCE {source:"env",provider,id} et non de valeur en
+  clair dans ce fichier (nuance par rapport a l'hypothese initiale d'un
+  jeton Slack toujours inline ; la valeur reelle est alors dans une variable
+  d'environnement, cf. service-env/*.env non couvert par cet artefact),
+  skills.entries.<name>.enabled, wizard.lastRun*, meta.lastTouched*.
+
+  RedactSecrets (defaut Y) applique un masquage best-effort par regex sur les
+  cles connues (token, key, secret, password, passphrase, pem, credential,
+  authorization) AVANT de parser le JSON, pour permettre une collecte large
+  (hunt) sans exporter de secrets en clair. La correspondance porte sur le nom
+  de cle COMPLET avec prefixe/suffixe (`anthropic_api_key`, `gatewayToken`,
+  `privateKeyPem`... sont couverts) ; le test sur fixtures a montre qu'une
+  regle ancree uniquement sur `key` laissait passer `anthropic_api_key`, d'ou
+  l'elargissement. C'est une heuristique sur les noms de cles : elle ne
+  garantit pas la detection d'un secret range sous un nom inhabituel, et elle
+  peut au contraire rediger des valeurs anodines dont le nom contient un de
+  ces mots (sur-redaction assumee, choisie comme defaut sur).
+  Mettre RedactSecrets=N uniquement pour une investigation ciblee et
+  autorisee sur un client precis (le gateway.auth.token, s'il existe, sera
+  alors visible en clair).
+
+  Le hash SHA-256 du fichier brut (non redige) est toujours fourni pour
+  permettre une correlation d'integrite independamment de la redaction.
+
+type: CLIENT
+
+author: Safercy DFIR (recherche Velociraptor OpenClaw)
+
+precondition: SELECT OS FROM info() WHERE OS = 'darwin'
+
+parameters:
+  - name: ProfileGlob
+    default: /Users/*
+  - name: StateDirNameGlob
+    default: ".openclaw*"
+  - name: RedactSecrets
+    type: bool
+    default: Y
+  - name: Upload_Raw
+    type: bool
+    default: N
+    description: Upload du fichier openclaw.json original (non redige) vers le serveur, pour preuve autorisee.
+
+export: |
+  LET Profiles = SELECT OSPath AS HomeDir FROM glob(globs=ProfileGlob) WHERE IsDir
+
+  LET RedactText(Text) = regex_replace(
+      source=regex_replace(
+        source=regex_replace(
+          source=Text,
+          re='(?i)"([a-z0-9_-]*(?:token|secret|password|passwd|passphrase|pem|credential|key)[a-z0-9_-]*)"\\s*:\\s*"[^"]*"',
+          replace='"$1": "<REDACTED>"'),
+        re='(?i)-----BEGIN [A-Z ]*PRIVATE KEY-----[\\s\\S]*?-----END [A-Z ]*PRIVATE KEY-----',
+        replace='<REDACTED-PEM-PRIVATE-KEY>'),
+      re='(?i)"(authorization)"\\s*:\\s*"[^"]*"',
+      replace='"$1": "<REDACTED>"')
+
+sources:
+  - name: ConfigFiles
+    query: |
+      LET Files = SELECT * FROM foreach(row=Profiles, query={
+        SELECT HomeDir.Path AS UserProfile, OSPath, Mtime, Ctime, Btime, Size
+        FROM glob(globs=[
+          HomeDir.Path + '/' + StateDirNameGlob + '/openclaw.json',
+          HomeDir.Path + '/' + StateDirNameGlob + '/config.json',
+          HomeDir.Path + '/' + StateDirNameGlob + '/openclaw.json.bak',
+          HomeDir.Path + '/' + StateDirNameGlob + '/openclaw.json.bak.*',
+          HomeDir.Path + '/' + StateDirNameGlob + '/openclaw.json.last-good'
+        ], accessor='file')
+      })
+
+      SELECT UserProfile, OSPath AS SourcePath, Mtime, Ctime, Btime, Size,
+             hash(path=OSPath).SHA256 AS SHA256Raw,
+             parse_json(data=if(condition=RedactSecrets,
+                                 then=RedactText(Text=read_file(filename=OSPath)),
+                                 else=read_file(filename=OSPath))) AS Content,
+             RedactSecrets AS Redacted,
+             if(condition=Upload_Raw, then=upload(file=OSPath, mtime=Mtime, ctime=Ctime, btime=Btime)) AS RawUpload,
+             'glob+read_file+parse_json (regex redaction best-effort)' AS ExtractionMethod
+      FROM Files
+
+  - name: ConfigAuditLog
+    query: |
+      LET Files = SELECT * FROM foreach(row=Profiles, query={
+        SELECT HomeDir.Path AS UserProfile, OSPath
+        FROM glob(globs=HomeDir.Path + '/' + StateDirNameGlob + '/logs/config-audit.jsonl', accessor='file')
+      })
+
+      LET AllLines = SELECT * FROM foreach(row=Files, query={
+        SELECT UserProfile, OSPath AS SourcePath, count() AS LineNumber,
+               Line, parse_json(data=Line) AS Row
+        FROM parse_lines(filename=OSPath)
+      })
+
+      SELECT UserProfile, SourcePath, LineNumber,
+             if(condition=Row.ts, then=timestamp(string=Row.ts)) AS EventTimestamp,
+             Row.ts AS EventTimestampRaw,
+             Row.source AS Source, Row.event AS Event, Row.configPath AS ConfigPath,
+             Row.pid AS Pid, Row.ppid AS Ppid, Row.cwd AS Cwd, Row.argv AS Argv,
+             Row.execArgv AS ExecArgv, Row.watchMode AS WatchMode,
+             Row.existsBefore AS ExistsBefore, Row.result AS Result,
+             Row.gatewayModeBefore AS GatewayModeBefore, Row.gatewayModeAfter AS GatewayModeAfter,
+             Row.previousHash AS PreviousHash, Row.nextHash AS NextHash,
+             Row.previousBytes AS PreviousBytes, Row.nextBytes AS NextBytes,
+             Row.changedPathCount AS ChangedPathCount,
+             Row.nextUid AS NextUid, Row.nextGid AS NextGid, Row.nextMode AS NextMode,
+             Row.suspicious AS Suspicious,
+             Row = NULL AS ParseError,
+             if(condition=Row = NULL, then=substr(str=Line, start=0, end=200)) AS ParseErrorSample,
+             'parse_lines + parse_json par ligne' AS ExtractionMethod
+      FROM AllLines
+      WHERE len(list=Line) > 0

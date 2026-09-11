@@ -1,0 +1,106 @@
+name: Custom.MacOS.Applications.OpenClaw.Collection
+description: |
+  Collecte brute (upload) du repertoire d'etat OpenClaw pour preservation de
+  preuve AVANT une eventuelle desinstallation. `openclaw uninstall` supprime
+  ~/.openclaw de facon irreversible ("pas d'undo" d'apres la documentation
+  du produit) ; un simple retrait de l'app/du paquet npm laisse ce
+  repertoire intact. Cette collecte doit donc etre executee des la
+  detection (cf. Custom.MacOS.Applications.OpenClaw.Presence) et avant toute
+  action de remediation.
+
+  Exclut par defaut npm/** (Include_Npm=N, dependances de skills, tres
+  volumineux, faible valeur forensique) et tmp/** (fichiers temporaires
+  applicatifs). Inclut par defaut les bases SQLite (Include_Sqlite=Y) : leur
+  contenu (auth_profile_store/state, memoire, etat central) est preserve tel
+  quel pour analyse hors ligne, WAL/SHM compris quand presents -- SIGNALER
+  dans le rapport si -wal/-shm sont absents au moment de la collecte
+  (transactions non checkpointees potentiellement invisibles).
+
+  ATTENTION : cette collecte inclut des fichiers contenant des secrets en
+  clair confirmes sur la cible de validation (identity/device.json = cle privee Ed25519 PEM,
+  devices/paired.json = jeton bearer operateur, openclaw.json =
+  gateway.auth.token). Le manifeste d'evidence (hash SHA-256 par fichier,
+  cf. methodologie du projet) doit etre archive separement des livrables
+  partages publiquement.
+
+  MaxFileBytes protege contre l'upload de fichiers anormalement gros
+  (ex. base memoire tres remplie). Les repertoires absents ne generent pas
+  d'erreur (glob() ne retourne simplement aucune ligne).
+
+type: CLIENT
+
+author: Safercy DFIR (recherche Velociraptor OpenClaw)
+
+precondition: SELECT OS FROM info() WHERE OS = 'darwin'
+
+parameters:
+  - name: ProfileGlob
+    default: /Users/*
+  - name: StateDirNameGlob
+    default: ".openclaw*"
+  - name: Include_Npm
+    type: bool
+    default: N
+  - name: Include_Sqlite
+    type: bool
+    default: Y
+  - name: MaxFileBytes
+    type: int64
+    default: 104857600
+  - name: Calculate_Hash
+    type: bool
+    default: Y
+
+export: |
+  LET Profiles = SELECT OSPath AS HomeDir FROM glob(globs=ProfileGlob) WHERE IsDir
+
+sources:
+  - name: Files
+    query: |
+      LET Candidates = SELECT * FROM foreach(row=Profiles, query={
+        SELECT HomeDir.Path AS UserProfile, OSPath, Size, Mtime, Ctime, Btime, IsDir
+        FROM glob(globs=[
+          HomeDir.Path + '/' + StateDirNameGlob + '/openclaw.json*',
+          HomeDir.Path + '/' + StateDirNameGlob + '/credentials/**',
+          HomeDir.Path + '/' + StateDirNameGlob + '/devices/**',
+          HomeDir.Path + '/' + StateDirNameGlob + '/identity/**',
+          HomeDir.Path + '/' + StateDirNameGlob + '/logs/**',
+          HomeDir.Path + '/' + StateDirNameGlob + '/agents/*/sessions/**',
+          HomeDir.Path + '/' + StateDirNameGlob + '/workspace/**',
+          HomeDir.Path + '/' + StateDirNameGlob + '/workspace-attestations/**',
+          HomeDir.Path + '/' + StateDirNameGlob + '/tui/**',
+          HomeDir.Path + '/' + StateDirNameGlob + '/service-env/**',
+          HomeDir.Path + '/' + StateDirNameGlob + '/plugin-skills/**',
+          HomeDir.Path + '/' + StateDirNameGlob + '/update-check.json',
+          HomeDir.Path + '/' + StateDirNameGlob + '/gateway-supervisor-restart-handoff.json'
+        ], accessor='file', nosymlink=TRUE)
+        WHERE NOT IsDir
+      })
+
+      LET SqliteFiles = SELECT * FROM if(condition=Include_Sqlite, then={
+        SELECT * FROM foreach(row=Profiles, query={
+          SELECT HomeDir.Path AS UserProfile, OSPath, Size, Mtime, Ctime, Btime, FALSE AS IsDir
+          FROM glob(globs=[
+            HomeDir.Path + '/' + StateDirNameGlob + '/agents/*/agent/*.sqlite*',
+            HomeDir.Path + '/' + StateDirNameGlob + '/state/*.sqlite*'
+          ], accessor='file')
+        })
+      })
+
+      LET NpmFiles = SELECT * FROM if(condition=Include_Npm, then={
+        SELECT * FROM foreach(row=Profiles, query={
+          SELECT HomeDir.Path AS UserProfile, OSPath, Size, Mtime, Ctime, Btime, IsDir
+          FROM glob(globs=HomeDir.Path + '/' + StateDirNameGlob + '/npm/**', accessor='file')
+          WHERE NOT IsDir
+        })
+      })
+
+      LET AllFiles = SELECT * FROM chain(a=Candidates, b=SqliteFiles, c=NpmFiles)
+
+      SELECT UserProfile, OSPath AS SourcePath, Size, Mtime, Ctime, Btime,
+             Size > MaxFileBytes AS SkippedTooLarge,
+             if(condition=Size <= MaxFileBytes,
+                then=upload(file=OSPath, mtime=Mtime, ctime=Ctime, btime=Btime)) AS Upload,
+             if(condition=Calculate_Hash AND Size <= MaxFileBytes,
+                then=hash(path=OSPath)) AS Hash
+      FROM AllFiles

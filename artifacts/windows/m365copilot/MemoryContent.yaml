@@ -1,0 +1,51 @@
+name: Custom.Windows.Applications.M365Copilot.MemoryContent
+description: |
+  Targeted volatile content search in the M365Copilot process and its WebView2
+  descendants (up to four generations). No process dump, code execution or
+  credential use. Rules must be provided explicitly. Results are memory
+  fragments, not automatically complete messages. Preserve offsets and raw
+  binary contexts. PID/name/parent snapshot accompanies each fragment.
+  regex optionally filters UTF-8 or UTF-16LE interpretations of the context.
+  Apply collection time/row limits; MaxHits is per selected process.
+type: CLIENT
+precondition: |
+  SELECT OS FROM info() WHERE OS = 'windows'
+parameters:
+  - name: Rules
+    default: ""
+    description: |
+      Explicit YARA rules for the content sought.
+  - name: ContextBytes
+    type: int
+    default: 4096
+  - name: MaxHits
+    type: int
+    default: 128
+  - name: regex
+    type: regex
+    default: ""
+export: |
+  LET Processes <= SELECT Pid, Ppid, Name, Exe, CommandLine, CreateTime FROM pslist()
+  LET Roots <= SELECT * FROM Processes WHERE Name =~ '(?i)^M365Copilot[.]exe$'
+  LET L1 <= SELECT * FROM Processes WHERE Pid IN Roots.Pid OR Ppid IN Roots.Pid
+  LET L2 <= SELECT * FROM Processes WHERE Pid IN L1.Pid OR Ppid IN L1.Pid
+  LET L3 <= SELECT * FROM Processes WHERE Pid IN L2.Pid OR Ppid IN L2.Pid
+  LET L4 <= SELECT * FROM Processes WHERE Pid IN L3.Pid OR Ppid IN L3.Pid
+  LET Targets <= SELECT * FROM L4 WHERE Name =~ '(?i)^(M365Copilot|msedgewebview2)[.]exe$'
+sources:
+  - name: Processes
+    query: |
+      SELECT * FROM Targets
+  - name: Fragments
+    query: |
+      LET Selected = SELECT * FROM Targets WHERE Rules
+      LET Hits = SELECT * FROM foreach(row=Selected, query={
+        SELECT Pid, Ppid, Name AS ProcessName, Exe, CreateTime,
+          Rule, String.Name AS Needle, String.Offset AS MatchOffset,
+          String.Data AS RawContext,
+          format(format='%s', args=[String.Data]) AS UTF8Context,
+          utf16(string=String.Data) AS UTF16Context,
+          now() AS CollectionTime, 'VolatileMemoryFragment' AS EvidenceType
+        FROM proc_yara(pid=Pid, rules=Rules, context=ContextBytes, number=MaxHits)
+      })
+      SELECT * FROM Hits WHERE Rules AND (NOT regex OR UTF8Context =~ regex OR UTF16Context =~ regex)

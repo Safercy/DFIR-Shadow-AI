@@ -1,0 +1,54 @@
+name: Custom.Windows.Detection.CursorPresence
+description: |
+  Detect Cursor installation, running processes and execution traces on Windows.
+  File timestamps indicate metadata, not first execution. Profile paths are
+  discovered from ProfileList; AdditionalProfileGlobs covers unregistered profiles.
+type: CLIENT
+precondition: |
+  SELECT OS FROM info() WHERE OS = 'windows'
+parameters:
+  - name: AdditionalProfileGlobs
+    default: C:/Users/*
+  - name: AdditionalInstallGlobs
+    default: ""
+    description: |
+      Additional Cursor.exe or package.json paths for portable/custom installs.
+export: |
+  LET Profiles = SELECT UserProfile FROM chain(
+    a={ SELECT expand(path=Directory) AS UserProfile FROM Artifact.Windows.Sys.Users() },
+    b={ SELECT OSPath AS UserProfile FROM glob(globs=AdditionalProfileGlobs) WHERE IsDir })
+    GROUP BY UserProfile
+sources:
+  - name: Profiles
+    query: |
+      SELECT * FROM Profiles
+  - name: Installation
+    query: |
+      LET Globs = SELECT Glob FROM chain(
+        a={ SELECT UserProfile + '/AppData/Local/Programs/cursor/Cursor.exe' AS Glob FROM Profiles },
+        b={ SELECT UserProfile + '/AppData/Local/Programs/cursor/resources/app/package.json' AS Glob FROM Profiles },
+        c={ SELECT UserProfile + '/AppData/Roaming/Cursor' AS Glob FROM Profiles },
+        d={ SELECT UserProfile + '/.cursor' AS Glob FROM Profiles },
+        e={ SELECT _value AS Glob FROM foreach(row=['C:/Program Files/Cursor/Cursor.exe',
+          'C:/Program Files/Cursor/resources/app/package.json', 'C:/Program Files (x86)/Cursor/Cursor.exe']) },
+        f={ SELECT _value AS Glob FROM foreach(row=split(string=AdditionalInstallGlobs, sep='\n')) WHERE _value })
+      SELECT OSPath AS SourcePath, Size, IsDir, Mtime, Btime,
+        if(condition=Name = 'package.json',
+          then=parse_json(data=read_file(filename=OSPath, length=1048576)).version) AS Version
+      FROM glob(globs=Globs.Glob)
+  - name: Processes
+    query: |
+      SELECT Pid, Ppid, Name, Exe, CommandLine, Username, CreateTime
+      FROM pslist() WHERE Name =~ '(?i)^cursor[.]exe$'
+  - name: Prefetch
+    query: |
+      SELECT OSPath, Executable, ExecutableDosPath, RunCount, LastRunTimes,
+        CreationTime, ModificationTime
+      FROM Artifact.Windows.Forensics.Prefetch(binaryRegex='(?i)^cursor[.]exe$')
+  - name: BAM
+    query: |
+      SELECT * FROM Artifact.Windows.Forensics.Bam() WHERE Binary =~ '(?i)cursor[.]exe$'
+  - name: Timezone
+    query: |
+      SELECT TimeZoneKeyName, Bias, ActiveTimeBias, StandardBias, DaylightBias
+      FROM read_reg_key(globs='HKEY_LOCAL_MACHINE/SYSTEM/CurrentControlSet/Control/TimeZoneInformation',accessor='registry')
